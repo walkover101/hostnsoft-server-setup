@@ -283,12 +283,25 @@ usermod -aG docker "${APP_USER}" || true
 
 # ---------------------------------------------------------------------------
 # 4. BuildKit + Railpack
+#
+# Pinned to v0.30.0, NOT :latest — deliberate. BuildKit v0.31.0+ (through
+# at least v0.32.2) bundles a runc with a masked-paths hardening regression
+# (CVE-2025-31133 / 52881 / 52565): runc's maskDir() now mounts masked
+# paths like /proc/acpi with a tmpfs option (nr_inodes=1) that several
+# kernels — confirmed on Ubuntu 20.04's 5.4 kernel, also seen on various
+# cloud/KVM guest kernels — reject with EINVAL, so EVERY build-step
+# container fails at init with "can't mask dir ... invalid argument".
+# v0.30.0 is the last release before this regression (runc 1.3.5,
+# unaffected). Confirmed in practice, not theoretical — this exact
+# failure has been hit. Bump this pin once BuildKit ships runc >= 1.4.4
+# (the fixed version) — check https://github.com/moby/moby/issues/52972
+# before assuming a newer tag is safe again.
 # ---------------------------------------------------------------------------
 echo "--> Starting BuildKit"
 docker rm -f buildkit >/dev/null 2>&1 || true
-docker run --privileged -d --name buildkit moby/buildkit
+docker run --privileged -d --name buildkit moby/buildkit:v0.30.0
 
-# Verify it's actually running — if the current `moby/buildkit:latest` image
+# Verify it's actually running — if the pinned moby/buildkit image
 # turns out to need Docker Engine features this OS's docker.io version
 # doesn't have, this catches it here with a clear message, rather than the
 # failure surfacing confusingly later as "railpack build" mysteriously
@@ -297,8 +310,8 @@ sleep 2
 if ! docker ps --filter name=buildkit --filter status=running -q | grep -q .; then
   echo "ERROR: BuildKit container failed to start or exited immediately." >&2
   echo "This may mean the installed Docker Engine version is too old for" >&2
-  echo "the current moby/buildkit:latest image. Check what's actually" >&2
-  echo "installed and consider pinning an older BuildKit tag if so:" >&2
+  echo "the pinned moby/buildkit:v0.30.0 image. Check what's actually" >&2
+  echo "installed:" >&2
   echo "  docker version" >&2
   echo "  docker logs buildkit" >&2
   exit 1
@@ -558,9 +571,18 @@ echo "--> Generating .env files from each repo's .env.example"
 # indirect lookup (${!key}) picks them up and bakes them into each
 # service's actual .env — both services load their .env via dotenv, so
 # this is what they see at runtime, not whatever's on pm2's command line.
-export PORT="${API_PORT}"
+#
+# PORT is exported separately per service, right before that service's
+# own hydrate_env_file call — deploy-service and api-service each need a
+# DIFFERENT port (DEPLOY_PORT vs API_PORT), so a single shared export
+# would leak the wrong value into whichever one hydrates second.
 export HOSTNSOFT_API_URL="http://127.0.0.1:${API_PORT}"
+export APPS_DOMAIN_SUFFIX  # value already computed in section 0 above
+
+export PORT="${DEPLOY_PORT}"
 hydrate_env_file "${APP_HOME}/${DEPLOY_SERVICE_NAME}"
+
+export PORT="${API_PORT}"
 hydrate_env_file "${APP_HOME}/${API_SERVICE_NAME}"
 
 chown -R "${APP_USER}:${APP_USER}" "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_NAME}" "${APP_HOME}/traefik.nomad"

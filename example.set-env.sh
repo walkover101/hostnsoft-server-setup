@@ -69,14 +69,14 @@ fi
 #     secret — don't commit set-env.sh with a real token embedded in it.
 
 # ---------------------------------------------------------------------
-# Auto-generate INTERNAL_SECRET if not already set — printed once so
+# Auto-generate INTERNAL_API_SECRET if not already set — printed once so
 # you can save it; server-setup.sh would generate its own if left unset
 # here, but generating it up front means you see the value before, not
 # only buried in that script's final output.
 # ---------------------------------------------------------------------
-if [[ -z "${INTERNAL_SECRET:-}" ]]; then
-  export INTERNAL_SECRET="$(openssl rand -hex 32)"
-  echo "==> Generated INTERNAL_SECRET: ${INTERNAL_SECRET}"
+if [[ -z "${INTERNAL_API_SECRET:-}" ]]; then
+  export INTERNAL_API_SECRET="$(openssl rand -hex 32)"
+  echo "==> Generated INTERNAL_API_SECRET: ${INTERNAL_API_SECRET}"
 fi
 
 echo ""
@@ -88,7 +88,7 @@ echo "    APPS_SUBDOMAIN_BASE=${APPS_SUBDOMAIN_BASE}"
 echo "    APP_USER=${APP_USER}"
 echo "    DEPLOY_SERVICE_REPO=${DEPLOY_SERVICE_REPO}  (branch: ${APP_ENV})"
 echo "    API_SERVICE_REPO=${API_SERVICE_REPO}  (branch: ${APP_ENV})"
-echo "    (CF_DNS_API_TOKEN, INTERNAL_SECRET are set but not printed again here)"
+echo "    (CF_DNS_API_TOKEN, INTERNAL_API_SECRET are set but not printed again here)"
 echo ""
 echo "==> DNS mapping is manual — see README.md before running server-setup.sh."
 echo "==> Now run: sudo -E bash ${APP_ENV}.server-setup.sh   (or server-setup.sh, whatever you named your copy)"

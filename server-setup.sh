@@ -58,8 +58,11 @@
 #   API_SERVICE_REPO    git URL for api-service's source
 #
 # Optional:
-#   INTERNAL_SECRET      shared secret between deploy-service and api-service;
-#                        if not set, one is generated
+#   INTERNAL_API_SECRET  shared secret between deploy-service and api-service;
+#                        if not set, one is generated. Must be named exactly
+#                        this — it's written into each service's .env under
+#                        the key their own code actually reads
+#                        (process.env.INTERNAL_API_SECRET in both repos).
 #   DEPLOY_SUBDOMAIN     default: ship
 #   APPS_SUBDOMAIN_BASE  default: app   (apps live at <name>.<APPS_SUBDOMAIN_BASE>.[<env>.]<DOMAIN>)
 #   APP_USER             default: ubuntu (the user both services and pm2 run as — shared across environments, not env-prefixed)
@@ -81,7 +84,7 @@ if [[ ! "$APP_ENV" =~ ^(test|demo|prod)$ ]]; then
   exit 1
 fi
 
-INTERNAL_SECRET="${INTERNAL_SECRET:-$(openssl rand -hex 32)}"
+export INTERNAL_API_SECRET="${INTERNAL_API_SECRET:-$(openssl rand -hex 32)}"
 DEPLOY_SUBDOMAIN="${DEPLOY_SUBDOMAIN:-ship}"
 APPS_SUBDOMAIN_BASE="${APPS_SUBDOMAIN_BASE:-app}"
 APP_USER="${APP_USER:-ubuntu}"
@@ -551,6 +554,12 @@ echo "--> Pulling ${API_SERVICE_NAME} from ${API_SERVICE_REPO} (branch: ${APP_EN
 clean_pull "${API_SERVICE_REPO}" "${APP_HOME}/${API_SERVICE_NAME}" "${APP_ENV}"
 
 echo "--> Generating .env files from each repo's .env.example"
+# Exported here (not just passed to pm2 later) so hydrate_env_file's
+# indirect lookup (${!key}) picks them up and bakes them into each
+# service's actual .env — both services load their .env via dotenv, so
+# this is what they see at runtime, not whatever's on pm2's command line.
+export PORT="${API_PORT}"
+export HOSTNSOFT_API_URL="http://127.0.0.1:${API_PORT}"
 hydrate_env_file "${APP_HOME}/${DEPLOY_SERVICE_NAME}"
 hydrate_env_file "${APP_HOME}/${API_SERVICE_NAME}"
 
@@ -652,23 +661,51 @@ sudo -u "${APP_USER}" bash -c "nomad job run ${APP_HOME}/traefik.nomad"
 
 # ---------------------------------------------------------------------------
 # 9. Start both services under pm2, persist across reboots
+#
+# A pm2 ecosystem file (not ad-hoc `pm2 start npm --name ...` CLI calls)
+# is written to ${APP_HOME}/ecosystem.config.js — a discoverable, re-runnable
+# definition of both processes. Per-environment secrets/URLs (INTERNAL_API_SECRET,
+# PORT, HOSTNSOFT_API_URL) are NOT duplicated here — they're already baked
+# into each service's own .env by hydrate_env_file above, which each
+# service loads itself via dotenv. Only BUILDKIT_HOST goes in `env` below,
+# since it isn't an app secret, just something deploy-service's child
+# `railpack`/buildkit invocations expect to inherit.
+#
+# Once this has run once, ${PM2_DEPLOY_NAME}/${PM2_API_NAME} are registered
+# with pm2 by name — `pm2 restart <name>` or `pm2 start <name>` (after a
+# stop) work with no arguments from then on; re-running this whole
+# ecosystem file also works (`pm2 start ecosystem.config.js`).
 # ---------------------------------------------------------------------------
-echo "--> Starting ${PM2_DEPLOY_NAME} and ${PM2_API_NAME} under pm2"
+echo "--> Writing pm2 ecosystem file and starting ${PM2_DEPLOY_NAME} + ${PM2_API_NAME}"
 echo "    (using 'npm start' — each repo's package.json must define a"
 echo "    'start' script; this script no longer assumes a specific entry"
 echo "    filename, since the code comes from your own repos now)"
+cat > "${APP_HOME}/ecosystem.config.js" << EOF
+module.exports = {
+  apps: [
+    {
+      name: '${PM2_API_NAME}',
+      cwd: '${APP_HOME}/${API_SERVICE_NAME}',
+      script: 'npm',
+      args: 'start',
+    },
+    {
+      name: '${PM2_DEPLOY_NAME}',
+      cwd: '${APP_HOME}/${DEPLOY_SERVICE_NAME}',
+      script: 'npm',
+      args: 'start',
+      env: {
+        BUILDKIT_HOST: 'docker-container://buildkit',
+      },
+    },
+  ],
+};
+EOF
+chown "${APP_USER}:${APP_USER}" "${APP_HOME}/ecosystem.config.js"
+
 sudo -u "${APP_USER}" bash -c "
-  cd ${APP_HOME}/${API_SERVICE_NAME}
-  INTERNAL_SECRET='${INTERNAL_SECRET}' PORT='${API_PORT}' \
-    pm2 start npm --name ${PM2_API_NAME} -- start
-
-  cd ${APP_HOME}/${DEPLOY_SERVICE_NAME}
-  INTERNAL_SECRET='${INTERNAL_SECRET}' \
-    API_SERVICE_URL='http://127.0.0.1:${API_PORT}' \
-    HOSTNSOFT_API_URL='http://127.0.0.1:${API_PORT}' \
-    BUILDKIT_HOST='docker-container://buildkit' \
-    pm2 start npm --name ${PM2_DEPLOY_NAME} -- start
-
+  cd ${APP_HOME}
+  pm2 start ecosystem.config.js
   pm2 save
 "
 env PATH=$PATH:/usr/bin pm2 startup systemd -u "${APP_USER}" --hp "${APP_HOME}" || true
@@ -692,7 +729,11 @@ echo " deploy-service:  directory ${DEPLOY_SERVICE_NAME}, pm2 process '${PM2_DEP
 echo " api-service:     directory ${API_SERVICE_NAME}, pm2 process '${PM2_API_NAME}'  (https://${DEPLOY_HOST}/api)"
 echo " Apps live at:    https://<app-name>.${APPS_DOMAIN_SUFFIX}"
 echo ""
-echo " INTERNAL_SECRET (deploy-service <-> api-service, never customer-facing): ${INTERNAL_SECRET}"
+echo " pm2 ecosystem file: ${APP_HOME}/ecosystem.config.js"
+echo " From now on: pm2 restart ${PM2_API_NAME}   /   pm2 restart ${PM2_DEPLOY_NAME}"
+echo " (or, from a clean slate: cd ${APP_HOME} && pm2 start ecosystem.config.js)"
+echo ""
+echo " INTERNAL_API_SECRET (deploy-service <-> api-service, never customer-facing): ${INTERNAL_API_SECRET}"
 echo ""
 echo " Save this now — it will not be shown again by this script."
 echo ""

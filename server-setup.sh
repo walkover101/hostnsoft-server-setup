@@ -119,6 +119,13 @@ PM2_API_NAME="${APP_ENV}-api-service"
 
 DEPLOY_HOST="${DEPLOY_SUBDOMAIN}.${DOMAIN_ENV_SEGMENT}${DOMAIN}"
 APPS_DOMAIN_SUFFIX="${APPS_SUBDOMAIN_BASE}.${DOMAIN_ENV_SEGMENT}${DOMAIN}"
+# Dedicated CNAME target for CLIENT custom domains (see api-service's
+# docs/Customdomain-req.md) — deliberately a separate hostname from
+# DEPLOY_HOST/APPS_DOMAIN_SUFFIX above, and must stay unproxied if this
+# host ever sits behind a proxying CDN: an external domain not managed in
+# that same proxy account can't be CNAME'd to a proxied hostname. Same
+# env-segment convention as the other computed hostnames above.
+EDGE_HOSTNAME="edge.${DOMAIN_ENV_SEGMENT}${DOMAIN}"
 
 echo "=================================================================="
 echo " Provisioning — environment: ${APP_ENV}"
@@ -127,6 +134,7 @@ echo " api-service      : ${API_SERVICE_NAME}  (port ${API_PORT})"
 echo " Deploy API host  : https://${DEPLOY_HOST}/apps"
 echo " api-service      : https://${DEPLOY_HOST}/api (internal-only otherwise)"
 echo " Apps wildcard    : https://<app>.${APPS_DOMAIN_SUFFIX}"
+echo " Custom-domain CNAME target : ${EDGE_HOSTNAME}  (must stay unproxied — see README.md)"
 echo "=================================================================="
 
 SERVER_IP=$(curl -s https://ifconfig.me || hostname -I | awk '{print $1}')
@@ -367,6 +375,13 @@ mkdir -p /opt/traefik
 touch /opt/traefik/acme.json
 chmod 600 /opt/traefik/acme.json
 
+# Separate cert storage for the HTTP-01 resolver (client custom domains,
+# see api-service's docs/Customdomain-req.md constraint #1) — kept apart
+# from acme.json (the platform's own DNS-01 certs) deliberately, so an
+# issue with one resolver's storage can't affect the other's.
+touch /opt/traefik/acme-http.json
+chmod 600 /opt/traefik/acme-http.json
+
 cat > /opt/traefik/dynamic.yml << EOF
 http:
   routers:
@@ -428,6 +443,7 @@ job "traefik" {
 
         volumes = [
           "/opt/traefik/acme.json:/acme.json",
+          "/opt/traefik/acme-http.json:/acme-http.json",
           "/opt/traefik/dynamic.yml:/etc/traefik/dynamic.yml"
         ]
 
@@ -444,7 +460,21 @@ job "traefik" {
           "--certificatesresolvers.cloudflare.acme.dnschallenge=true",
           "--certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare",
           "--certificatesresolvers.cloudflare.acme.email=${ACME_EMAIL}",
-          "--certificatesresolvers.cloudflare.acme.storage=/acme.json"
+          "--certificatesresolvers.cloudflare.acme.storage=/acme.json",
+          # HTTP-01 resolver for CLIENT custom domains (see api-service's
+          # docs/Customdomain-req.md constraint #1) — DNS-01 above only
+          # works for domains in this platform's own Cloudflare zone;
+          # HTTP-01 works for any domain pointed at this server regardless
+          # of who controls its DNS. Traefik natively excludes its own
+          # ACME challenge path from the web->websecure redirect above, so
+          # the two coexist on the same :80 entrypoint without conflict —
+          # confirmed against a real externally-pointed test domain before
+          # relying on this in prod; don't just take this comment's word
+          # for it.
+          "--certificatesresolvers.letsencrypt-http.acme.httpchallenge=true",
+          "--certificatesresolvers.letsencrypt-http.acme.httpchallenge.entrypoint=web",
+          "--certificatesresolvers.letsencrypt-http.acme.email=${ACME_EMAIL}",
+          "--certificatesresolvers.letsencrypt-http.acme.storage=/acme-http.json"
         ]
       }
 
@@ -578,6 +608,15 @@ echo "--> Generating .env files from each repo's .env.example"
 # would leak the wrong value into whichever one hydrates second.
 export HOSTNSOFT_API_URL="http://127.0.0.1:${API_PORT}"
 export APPS_DOMAIN_SUFFIX  # value already computed in section 0 above
+
+# Custom domains (api-service's docs/Customdomain-req.md) — both computed
+# automatically rather than requiring manual values in variables.sh:
+# EDGE_HOSTNAME follows the same env-segmented naming as every other
+# computed hostname here, and ORIGIN_SERVER_IP is exactly the same IP
+# this script already auto-detected for its own Traefik/DNS-instructions
+# use above — no reason to make an operator re-supply it by hand.
+export EDGE_HOSTNAME
+export ORIGIN_SERVER_IP="${SERVER_IP}"
 
 export PORT="${DEPLOY_PORT}"
 hydrate_env_file "${APP_HOME}/${DEPLOY_SERVICE_NAME}"
@@ -739,6 +778,7 @@ env PATH=$PATH:/usr/bin pm2 startup systemd -u "${APP_USER}" --hp "${APP_HOME}" 
 echo "--> DNS is set up manually — see README.md. Records needed for this environment:"
 echo "    A   ${DEPLOY_HOST}   -> ${SERVER_IP}"
 echo "    A   *.${APPS_DOMAIN_SUFFIX}   -> ${SERVER_IP}"
+echo "    A   ${EDGE_HOSTNAME}   -> ${SERVER_IP}   (custom-domain CNAME target — keep this one UNPROXIED if using a CDN in front of DNS)"
 
 # ---------------------------------------------------------------------------
 # Done
@@ -750,6 +790,7 @@ echo ""
 echo " deploy-service:  directory ${DEPLOY_SERVICE_NAME}, pm2 process '${PM2_DEPLOY_NAME}'  (https://${DEPLOY_HOST}/apps)"
 echo " api-service:     directory ${API_SERVICE_NAME}, pm2 process '${PM2_API_NAME}'  (https://${DEPLOY_HOST}/api)"
 echo " Apps live at:    https://<app-name>.${APPS_DOMAIN_SUFFIX}"
+echo " Custom-domain CNAME target: ${EDGE_HOSTNAME}"
 echo ""
 echo " pm2 ecosystem file: ${APP_HOME}/ecosystem.config.js"
 echo " From now on: pm2 restart ${PM2_API_NAME}   /   pm2 restart ${PM2_DEPLOY_NAME}"

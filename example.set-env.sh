@@ -30,6 +30,13 @@ export DEPLOY_SUBDOMAIN="${DEPLOY_SUBDOMAIN:-ship}"
 export APPS_SUBDOMAIN_BASE="${APPS_SUBDOMAIN_BASE:-app}"
 export APP_USER="${APP_USER:-ubuntu}"
 
+# For test/demo only (prod is always bare): uncomment to serve this
+# environment off the BARE domain (ship.<DOMAIN>) instead of the default
+# ship.<env>.<DOMAIN> — useful if that bare hostname already has DNS/a
+# cert from before this env-naming scheme existed. Directory names, pm2
+# process names, and the port offset are unaffected either way.
+# export DOMAIN_ENV_SEGMENT=""
+
 # ---------------------------------------------------------------------
 # Guard: refuse to proceed with unfilled placeholders
 # ---------------------------------------------------------------------

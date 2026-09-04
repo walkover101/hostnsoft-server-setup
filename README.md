@@ -48,7 +48,7 @@ sidecar image if it changed, and restart directly on the server:
 
 ```bash
 cd ~/deploy-service && git pull
-docker build -t orphan-banner-proxy:latest orphan-proxy/   # only if orphan-proxy/ exists in this checkout — see below
+docker build -t orphan-banner-proxy:local orphan-proxy/   # only if orphan-proxy/ exists in this checkout — see below
 pm2 restart <env>-deploy-service
 
 cd ~/api-service && git pull
@@ -57,7 +57,7 @@ pm2 restart <env>-api-service
 ```
 
 The `docker build` line matters more than it looks: `nomad-job-spec.js`
-references `orphan-banner-proxy:latest` with `force_pull = false`, so
+references `orphan-banner-proxy:local` with `force_pull = false`, so
 Nomad only ever uses whatever's already built locally on that node — a
 `git pull` alone does **not** rebuild it. Skipping this step after
 `orphan-proxy/proxy.js` changes (or on the very first deploy of this

@@ -97,7 +97,16 @@ if [[ "$APP_ENV" == "prod" ]]; then
   PORT_OFFSET=0
 else
   PREFIX="${APP_ENV}-"
-  DOMAIN_ENV_SEGMENT="${APP_ENV}."
+  # Overridable: export DOMAIN_ENV_SEGMENT="" before sourcing this (e.g. in
+  # your set-env.sh) to serve this environment off the BARE domain
+  # (ship.<DOMAIN> instead of ship.test.<DOMAIN>) — useful when a domain
+  # already has DNS/a cert provisioned for it from before this environment
+  # naming scheme existed. Directory names, pm2 process names, and the
+  # port offset below are untouched either way — this only affects the
+  # domain. Uses bash's "-" (not ":-") so an explicitly-empty override is
+  # honored — only a genuinely UNSET DOMAIN_ENV_SEGMENT falls back to the
+  # default "<env>." segment.
+  DOMAIN_ENV_SEGMENT="${DOMAIN_ENV_SEGMENT-${APP_ENV}.}"
   case "$APP_ENV" in
     test) PORT_OFFSET=1000 ;;
     demo) PORT_OFFSET=2000 ;;
@@ -605,7 +614,7 @@ clean_pull "${API_SERVICE_REPO}" "${APP_HOME}/${API_SERVICE_NAME}" "${APP_ENV}"
 # in place on every re-run of this script, picking up any code changes.
 if [[ -d "${APP_HOME}/${DEPLOY_SERVICE_NAME}/orphan-proxy" ]]; then
   echo "--> Building orphan-banner-proxy sidecar image"
-  docker build -t orphan-banner-proxy:latest "${APP_HOME}/${DEPLOY_SERVICE_NAME}/orphan-proxy"
+  docker build -t orphan-banner-proxy:local "${APP_HOME}/${DEPLOY_SERVICE_NAME}/orphan-proxy"
 fi
 
 echo "--> Generating .env files from each repo's .env.example"
@@ -629,6 +638,15 @@ export APPS_DOMAIN_SUFFIX  # value already computed in section 0 above
 # use above — no reason to make an operator re-supply it by hand.
 export EDGE_HOSTNAME
 export ORIGIN_SERVER_IP="${SERVER_IP}"
+
+# Anonymous deploys' orphan-proxy sidecar (deploy-service's
+# docs/Anonymous-deploy-req.md #5) — same underlying value as
+# ORIGIN_SERVER_IP above (this box's own address), under the name
+# deploy-service's own .env.example actually expects. Confirmed in
+# practice: Docker publishes this box's app container ports bound to
+# this exact address, not 0.0.0.0/127.0.0.1 — the sidecar needs to know
+# it to reach the app task it fronts at all.
+export ORIGIN_IP="${SERVER_IP}"
 
 export PORT="${DEPLOY_PORT}"
 hydrate_env_file "${APP_HOME}/${DEPLOY_SERVICE_NAME}"

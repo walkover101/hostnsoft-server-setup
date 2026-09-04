@@ -73,6 +73,8 @@ export MSG91_GENERATE_AUTH_TOKEN_URL="https://routes.msg91.com/api/change_me/gen
 export HOSTNSOFT_API_URL="http://127.0.0.1:4100"
 export APPS_DOMAIN_SUFFIX="app.embarko.ai"
 
+# ORIGIN_IP is NOT set here either — auto-computed by server-setup.sh
+# (see deploy-service's docs/Anonymous-deploy-req.md #5).
 # INTERNAL_API_SECRET is NOT set here either — see the note above; it's
 # generated once by server-setup.sh and written identically into both
 # services' .env files.

@@ -597,6 +597,17 @@ clean_pull "${DEPLOY_SERVICE_REPO}" "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_
 echo "--> Pulling ${API_SERVICE_NAME} from ${API_SERVICE_REPO} (branch: ${APP_ENV})"
 clean_pull "${API_SERVICE_REPO}" "${APP_HOME}/${API_SERVICE_NAME}" "${APP_ENV}"
 
+# Sidecar used only for orphan (anonymous, unclaimed) deploys — see
+# hostnsoft-deploy's docs/Anonymous-deploy-req.md #5 and
+# nomad-job-spec.js. Built ONCE here, not per-deploy: nomad-job-spec.js
+# references it by this fixed tag with force_pull=false, same convention
+# as every per-app image built locally by railpack. Idempotent — rebuilds
+# in place on every re-run of this script, picking up any code changes.
+if [[ -d "${APP_HOME}/${DEPLOY_SERVICE_NAME}/orphan-proxy" ]]; then
+  echo "--> Building orphan-banner-proxy sidecar image"
+  docker build -t orphan-banner-proxy:latest "${APP_HOME}/${DEPLOY_SERVICE_NAME}/orphan-proxy"
+fi
+
 echo "--> Generating .env files from each repo's .env.example"
 # Exported here (not just passed to pm2 later) so hydrate_env_file's
 # indirect lookup (${!key}) picks them up and bakes them into each

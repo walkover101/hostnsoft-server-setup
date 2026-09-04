@@ -43,12 +43,23 @@ branch, then re-run `sudo -E bash server-setup.sh` on that server (after
 re-sourcing the same `<env>.set-env.sh`/`<env>.variables.sh`).
 
 For a code-only change with no new dependency/env var, skip the full
-re-run — just pull and restart directly on the server:
+re-run — just pull, apply any pending migration, and restart directly on
+the server:
 
 ```bash
 cd ~/deploy-service && git pull && pm2 restart <env>-deploy-service
-cd ~/api-service && git pull && pm2 restart <env>-api-service
+
+cd ~/api-service && git pull
+npx prisma migrate deploy   # no-op if there's nothing pending — always safe to run
+pm2 restart <env>-api-service
 ```
+
+`npx prisma migrate deploy` **before** the restart, not after — api-service
+can fail confusingly on the first request that touches a column/table
+from a migration that was never applied, rather than failing clearly at
+startup. `server-setup.sh` itself now runs this automatically as part of
+a full re-provision, but this lightweight path doesn't go through that
+script, so it needs the same step done by hand.
 
 ## Custom domains — confirming HTTP-01 actually works
 

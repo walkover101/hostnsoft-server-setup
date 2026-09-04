@@ -3,7 +3,8 @@
 # server-setup.sh — Automated Server Provisioning: deploy-service + api-service
 # Installs and configures: Nomad, Docker (+BuildKit), Railpack, Traefik
 # (with Cloudflare DNS-01 TLS), deploy-service, and api-service (both
-# managed by pm2).
+# managed by pm2). Applies any pending Prisma migrations (for whichever
+# service has a schema) before starting either service under pm2.
 #
 # Target: a fresh Ubuntu 24.04 server.
 #
@@ -682,6 +683,27 @@ for svc_dir in "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_N
   if [[ "$HAS_BUILD_SCRIPT" == "yes" ]]; then
     echo "    ${svc_dir} has a build script — running it"
     sudo -u "${APP_USER}" bash -c "cd '${svc_dir}' && npm run build"
+  fi
+done
+
+# Apply pending Prisma migrations, for whichever service(s) actually use
+# Prisma — detected generically (a prisma/schema.prisma file), same "no
+# built-in knowledge of either repo's internals" philosophy as the build-
+# script check above, rather than hardcoding this to api-service by name.
+# `migrate deploy` (not `migrate dev`) is the correct command outside a
+# dev environment: it only applies already-committed migrations and never
+# prompts or generates new ones. Must run BEFORE pm2 starts anything
+# below — a service with a schema newer than its actual database (a
+# missing table/column from a migration that was never applied here)
+# will fail confusingly at the first request that touches it rather than
+# at a clear startup step. DATABASE_URL is already in this service's own
+# .env from hydrate_env_file above, which Prisma's CLI reads the same way
+# the app itself does.
+for svc_dir in "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_NAME}"; do
+  HAS_PRISMA_SCHEMA=$(sudo -u "${APP_USER}" bash -c "test -f '${svc_dir}/prisma/schema.prisma'" && echo "yes" || echo "no")
+  if [[ "$HAS_PRISMA_SCHEMA" == "yes" ]]; then
+    echo "    ${svc_dir} has a Prisma schema — applying pending migrations"
+    sudo -u "${APP_USER}" bash -c "cd '${svc_dir}' && npx prisma migrate deploy"
   fi
 done
 

@@ -1,0 +1,103 @@
+# Server setup
+
+## Provision a server
+
+```bash
+cp example.set-env.sh <env>.set-env.sh   # env = test | demo | prod
+# edit <env>.set-env.sh: fill in APP_ENV, DOMAIN, CF_DNS_API_TOKEN, ACME_EMAIL, DEPLOY_SERVICE_REPO, API_SERVICE_REPO
+
+cp prod.variables.sh <env>.variables.sh   # use as a template — see its own comments
+# edit <env>.variables.sh: fill in real values for whatever deploy-service/api-service's own .env.example files need
+# (DATABASE_URL, JWT_SECRET, MSG91_AUTHKEY, etc. — EDGE_HOSTNAME/ORIGIN_SERVER_IP are computed automatically, don't set them here)
+
+source <env>.set-env.sh
+source <env>.variables.sh
+sudo -E bash server-setup.sh
+```
+
+Re-running `server-setup.sh` is safe — it resets each service's code to
+match its remote branch, regenerates config, and restarts everything.
+
+## DNS records to create (manual — this script never touches DNS)
+
+Printed at the end of every run. For `prod` with `DOMAIN=embarko.ai`:
+
+| Record | Name | Value |
+|---|---|---|
+| A | `ship.embarko.ai` | the server's IP (printed by the script) |
+| A | `*.app.embarko.ai` | same server IP |
+| A | `edge.embarko.ai` | same server IP — **keep this one unproxied ("DNS only") if anything sits in front of DNS** |
+
+For `test`/`demo`, the env name is inserted before the base domain
+(`ship.test.embarko.ai`, `*.app.test.embarko.ai`, `edge.test.embarko.ai`).
+
+Wait for propagation before testing. First TLS cert issuance can take a
+minute or two once DNS is live.
+
+## Deploying code changes
+
+`server-setup.sh` pulls `DEPLOY_SERVICE_REPO`/`API_SERVICE_REPO` on the
+branch **named exactly `$APP_ENV`** (`test`, `demo`, or `prod`) — not
+`main`/`master`. To ship a change to an environment, merge into that
+branch, then re-run `sudo -E bash server-setup.sh` on that server (after
+re-sourcing the same `<env>.set-env.sh`/`<env>.variables.sh`).
+
+For a code-only change with no new dependency/env var, skip the full
+re-run — just pull and restart directly on the server:
+
+```bash
+cd ~/deploy-service && git pull && pm2 restart <env>-deploy-service
+cd ~/api-service && git pull && pm2 restart <env>-api-service
+```
+
+## Custom domains — confirming HTTP-01 actually works
+
+Do this once per server, against a real domain you control, before
+relying on the feature in prod. See `api-service/docs/Customdomain-req.md`
+for the full design; this is just the "does it actually work here" check.
+
+1. Point a real test domain's DNS at this server:
+   ```
+   A   test-http01.<your-domain>   ->   <server IP>
+   ```
+   Wait for it to resolve (`dig +short test-http01.<your-domain>`).
+
+2. Confirm the ACME HTTP-01 challenge path isn't being redirected to
+   HTTPS (this is the one thing the redirect rule could break):
+   ```bash
+   curl -v http://test-http01.<your-domain>/.well-known/acme-challenge/anything
+   ```
+   Expect a `404` (Traefik answering the path, nothing registered yet) —
+   **not** a `301`/`308` redirect to `https://`. A redirect here means
+   the HTTP-01 challenge will never succeed and needs fixing before
+   going further.
+
+3. Register and verify the domain against a real project via the API
+   (see the main API doc for the full request shape):
+   ```bash
+   curl -X POST https://ship.<domain>/api/companies/<id>/projects/<id>/domains \
+     -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+     -d '{"domain":"test-http01.<your-domain>"}'
+   # returns a CNAME instruction — actually create it:
+   #   CNAME   test-http01.<your-domain>   ->   edge.<domain>
+   # wait for that to resolve, then:
+   curl -X POST https://ship.<domain>/api/companies/<id>/projects/<id>/domains/test-http01.<your-domain>/verify \
+     -H "Authorization: Bearer <token>"
+   ```
+
+4. Confirm the cert actually issued and the app is reachable:
+   ```bash
+   curl -vI https://test-http01.<your-domain>
+   ```
+   Look for a valid certificate (issuer: Let's Encrypt) and a real
+   response — not a TLS handshake failure or Traefik's default cert.
+
+5. Check Traefik picked up the new resolver correctly:
+   ```bash
+   docker logs $(docker ps -qf name=traefik) 2>&1 | grep -i "letsencrypt-http\|acme"
+   ```
+
+What you need to run this: a real domain (or subdomain) you control DNS
+for, and the server already provisioned via `server-setup.sh` (ports
+80/443 open, both in `ufw` and in your cloud provider's security group —
+see the big warning `server-setup.sh` prints about this).

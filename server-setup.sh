@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # server-setup.sh — Automated Server Provisioning: deploy-service + api-service
-# Installs and configures: Nomad, Docker (+BuildKit), Railpack, Traefik
+# Installs and configures: Nomad, Docker (+BuildKit), Railpack, Redis, Traefik
 # (with Cloudflare DNS-01 TLS), deploy-service, and api-service (both
 # managed by pm2). Applies any pending Prisma migrations (for whichever
 # service has a schema) before starting either service under pm2.
@@ -300,6 +300,28 @@ fi
 usermod -aG docker "${APP_USER}" || true
 
 # ---------------------------------------------------------------------------
+# 3b. Redis — local instance for api-service (REDIS_URL in variables.sh).
+#     Bound to 127.0.0.1 only: never exposed publicly, no ufw rule needed.
+#     Idempotent — apt is a no-op if already installed; config is rewritten
+#     in place and the service restarted on every run.
+# ---------------------------------------------------------------------------
+echo "--> Installing Redis"
+if ! command -v redis-server >/dev/null 2>&1; then
+  wait_for_apt_lock
+  apt-get install -y redis-server
+fi
+sed -i -E 's/^#? *bind .*/bind 127.0.0.1 ::1/' /etc/redis/redis.conf
+sed -i -E 's/^#? *protected-mode .*/protected-mode yes/' /etc/redis/redis.conf
+sed -i -E 's/^#? *supervised .*/supervised systemd/' /etc/redis/redis.conf
+systemctl enable redis-server
+systemctl restart redis-server
+if ! redis-cli ping | grep -q PONG; then
+  echo "ERROR: Redis did not respond to PING after restart." >&2
+  journalctl -xeu redis-server --no-pager | tail -20 >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # 4. BuildKit + Railpack
 #
 # Pinned to v0.30.0, NOT :latest — deliberate. BuildKit v0.31.0+ (through
@@ -540,8 +562,8 @@ clean_pull() {
 # variables file is the source of truth for real values. A key with no
 # matching override keeps whatever default the example file itself has.
 #
-# ALSO appends any variable listed in variables.sh's own
-# APP_VARIABLE_NAMES array that ISN'T already covered by .env.example —
+# ALSO appends any variable listed in variables.sh's own exported
+# APP_VARIABLE_NAMES string (space-separated names) that ISN'T already covered by .env.example —
 # necessary because an example file can be incomplete/stale relative to
 # what the actual code needs (confirmed in practice: a real app required
 # JWT_SECRET, which its own .env.example didn't declare at all — without
@@ -578,7 +600,11 @@ hydrate_env_file() {
 
   # Append anything from variables.sh's APP_VARIABLE_NAMES not already
   # covered above — see comment block preceding this function for why.
-  local extra_names=("${APP_VARIABLE_NAMES[@]:-}")
+  # APP_VARIABLE_NAMES is an exported space-separated STRING, not an
+  # array — bash arrays can't be exported, so an array set in variables.sh
+  # would never reach this script through `sudo -E`.
+  local extra_names=()
+  read -ra extra_names <<< "${APP_VARIABLE_NAMES:-}"
   local appended_any=0
   for name in "${extra_names[@]}"; do
     if [[ -z "$name" ]]; then

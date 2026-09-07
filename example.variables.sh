@@ -41,7 +41,7 @@ export DATABASE_URL="file:./app_env.db"
 export JWT_SECRET="change me"
 export PORT=4100
 export NODE_ENV=production|test|demo
-export FRONTEND_ORIGIN="https://app.embarko.ai"   # placeholder until the dashboard frontend exists — see below
+export FRONTEND_ORIGIN="https://embarko.ai"   # placeholder until the dashboard frontend exists — see below
 export HOSTNSOFT_DEPLOY_URL="https://ship.embarko.ai"
 
 export MSG91_AUTHKEY="change me"

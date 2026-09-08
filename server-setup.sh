@@ -407,6 +407,25 @@ mkdir -p /opt/traefik
 touch /opt/traefik/acme.json
 chmod 600 /opt/traefik/acme.json
 
+# JSON access log, mounted out to the host — read by every environment's
+# hostnsoft-deploy (see its analytics/access-log-tailer.js) to build
+# per-app traffic/error/latency analytics. There is only ONE Traefik
+# instance regardless of environment (see the note above), so this one
+# log is shared read-only input for every environment's own analytics
+# ingestion, each tracking its own read position independently.
+#
+# world-readable+executable directory: Traefik's container writes this
+# file as root, but deploy-service reads it as the non-root APP_USER.
+# The file itself isn't chmod'd here (it doesn't exist until Traefik's
+# first log write) — this relies on Traefik creating it with the
+# ordinary 644 a root process gets under a standard umask, which is the
+# common case but hasn't been independently confirmed against this
+# exact Traefik image; if deploy-service logs permission-denied reading
+# this path, chmod the file itself (or adjust Traefik's container
+# umask) rather than loosening this directory further.
+mkdir -p /opt/traefik/logs
+chmod 755 /opt/traefik/logs
+
 # Separate cert storage for the HTTP-01 resolver (client custom domains,
 # see api-service's docs/Customdomain-req.md constraint #1) — kept apart
 # from acme.json (the platform's own DNS-01 certs) deliberately, so an
@@ -476,11 +495,18 @@ job "traefik" {
         volumes = [
           "/opt/traefik/acme.json:/acme.json",
           "/opt/traefik/acme-http.json:/acme-http.json",
-          "/opt/traefik/dynamic.yml:/etc/traefik/dynamic.yml"
+          "/opt/traefik/dynamic.yml:/etc/traefik/dynamic.yml",
+          "/opt/traefik/logs:/var/log/traefik"
         ]
 
         args = [
           "--accesslog=true",
+          # JSON (not the default CLF text) and to a file (not stdout) —
+          # every environment's hostnsoft-deploy reads this file directly
+          # off disk (see TRAEFIK_ACCESS_LOG_PATH); Nomad's own captured
+          # stdout log isn't something another process can tail.
+          "--accesslog.format=json",
+          "--accesslog.filepath=/var/log/traefik/access.log",
           "--entrypoints.web.address=:80",
           "--entrypoints.websecure.address=:443",
           "--entrypoints.web.http.redirections.entryPoint.to=websecure",
@@ -673,6 +699,18 @@ export ORIGIN_SERVER_IP="${SERVER_IP}"
 # this exact address, not 0.0.0.0/127.0.0.1 — the sidecar needs to know
 # it to reach the app task it fronts at all.
 export ORIGIN_IP="${SERVER_IP}"
+
+# Analytics (deploy-service's analytics/*.js) — TRAEFIK_ACCESS_LOG_PATH
+# is the same value across every environment (one shared Traefik
+# instance, see section 5 above); ANALYTICS_DB_PATH is per-environment
+# so prod/test/demo never write into the same SQLite file. Created here
+# (not left for the app to create) so it exists with the right owner
+# before deploy-service ever starts.
+export TRAEFIK_ACCESS_LOG_PATH="/opt/traefik/logs/access.log"
+ANALYTICS_DIR="/opt/hostnsoft-analytics/${APP_ENV}"
+mkdir -p "${ANALYTICS_DIR}"
+chown "${APP_USER}:${APP_USER}" "${ANALYTICS_DIR}"
+export ANALYTICS_DB_PATH="${ANALYTICS_DIR}/analytics.db"
 
 export PORT="${DEPLOY_PORT}"
 hydrate_env_file "${APP_HOME}/${DEPLOY_SERVICE_NAME}"

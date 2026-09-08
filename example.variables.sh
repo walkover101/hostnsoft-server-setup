@@ -75,6 +75,9 @@ export APPS_DOMAIN_SUFFIX="app.embarko.ai"
 
 # ORIGIN_IP is NOT set here either — auto-computed by server-setup.sh
 # (see deploy-service's docs/Anonymous-deploy-req.md #5).
+# TRAEFIK_ACCESS_LOG_PATH and ANALYTICS_DB_PATH are NOT set here either —
+# both auto-computed by server-setup.sh (see deploy-service's analytics/
+# and docs/CLAUDE.md).
 # INTERNAL_API_SECRET is NOT set here either — see the note above; it's
 # generated once by server-setup.sh and written identically into both
 # services' .env files.

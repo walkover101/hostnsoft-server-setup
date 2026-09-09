@@ -64,6 +64,13 @@ export MSG91_GENERATE_AUTH_TOKEN_URL="https://routes.msg91.com/api/change_me/gen
 # ORPHAN_CLEANUP_INTERVAL_MS: how often the cleanup job checks for
 # expired orphans. Default: 1h.
 # export ORPHAN_CLEANUP_INTERVAL_MS=3600000
+# Feature requests / feedback — see api-service's docs/request-feature-req.md.
+# Rolling-window rate limits for the public (unauthenticated)
+# POST /public/feature-requests endpoint. All optional, sensible defaults:
+# export FEATURE_REQUEST_RATE_WINDOW_MS=3600000
+# export FEATURE_REQUEST_RATE_PER_EMAIL=10
+# export FEATURE_REQUEST_RATE_PER_IP=20
+# export FEATURE_REQUEST_RATE_GLOBAL=500
 
 
 

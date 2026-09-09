@@ -115,6 +115,22 @@ git pull
 echo "--> Installing dependencies"
 npm install
 
+# `npm install` only regenerates the Prisma Client as a side effect of
+# @prisma/client's own postinstall hook, which only fires when npm
+# actually reinstalls something. A schema-only change (a new/changed
+# model with no new npm dependency) makes `npm install` a no-op — "up to
+# date, X packages" — so the generated client silently stays stale and
+# `npm run build` below fails on a model/field TypeScript doesn't know
+# about yet. Confirmed the hard way in production: this step was missing
+# here, and a schema change with no accompanying dependency broke the
+# build after `npm install` had already reported nothing to do. Must run
+# BEFORE the build below, and unconditionally (cheap no-op if nothing
+# changed) rather than only when `npm install` did something.
+if [[ -f "${API_DIR}/prisma/schema.prisma" ]]; then
+  echo "--> Regenerating Prisma Client"
+  npx prisma generate
+fi
+
 # See the identical build-step comment in the deploy-service section
 # above — api-service DOES define a build script (TypeScript -> dist/,
 # and "start" runs the compiled output), so this is the actual fix for

@@ -75,6 +75,14 @@ if [[ -d "${DEPLOY_DIR}/orphan-proxy" ]]; then
   docker build -t orphan-banner-proxy:local "${DEPLOY_DIR}/orphan-proxy"
 fi
 
+# A git pull can add/change dependencies (package.json + package-lock.json)
+# without this script knowing — `npm install` here is what actually fetches
+# them. MUST run before the build/restart below: without it, a new
+# `require(...)` pulled in by this commit crashes the process on restart
+# even though the pull itself succeeded cleanly.
+echo "--> Installing dependencies"
+npm install
+
 # Same generic detection as server-setup.sh — only runs a build if this
 # checkout actually defines one (deploy-service currently doesn't; this
 # stays generic rather than hardcoding "only api-service builds", so it
@@ -101,6 +109,11 @@ API_DIR="${APP_HOME}/${API_SERVICE_NAME}"
 echo "--> Pulling ${API_DIR}"
 cd "${API_DIR}"
 git pull
+
+# See the identical dependency-install comment in the deploy-service section
+# above.
+echo "--> Installing dependencies"
+npm install
 
 # See the identical build-step comment in the deploy-service section
 # above — api-service DOES define a build script (TypeScript -> dist/,

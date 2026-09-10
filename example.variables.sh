@@ -89,3 +89,9 @@ export APPS_DOMAIN_SUFFIX="app.embarko.ai"
 # generated once by server-setup.sh and written identically into both
 # services' .env files.
 
+# Optional, sensible default — uncomment only to override. How many of an
+# app's most recent local build images deploy-service keeps before
+# pruning older ones (see deploy-service's image-retention.js) — bounds
+# disk usage and defines how far back one-click rollback can reach.
+# export IMAGE_RETAIN_COUNT=5
+

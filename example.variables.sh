@@ -72,6 +72,14 @@ export MSG91_GENERATE_AUTH_TOKEN_URL="https://routes.msg91.com/api/change_me/gen
 # export FEATURE_REQUEST_RATE_PER_IP=20
 # export FEATURE_REQUEST_RATE_GLOBAL=500
 
+# AI-connector token endpoints (POST /connector/token, POST /connector/token/validate)
+# — see api-service's src/routes/connectorAuth.routes.ts. Both are public
+# (no proxy_auth_token header), each with its own per-IP rolling window.
+# All optional, sensible defaults:
+# export CONNECTOR_TOKEN_RATE_WINDOW_MS=3600000
+# export CONNECTOR_TOKEN_EXCHANGE_RATE_PER_IP=30
+# export CONNECTOR_TOKEN_VALIDATE_RATE_PER_IP=120
+
 
 
 # ---------------------------------------------------------------------

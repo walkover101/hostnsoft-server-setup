@@ -97,6 +97,20 @@ export APPS_DOMAIN_SUFFIX="app.embarko.ai"
 # generated once by server-setup.sh and written identically into both
 # services' .env files.
 
+# Analytics tuning (see deploy-service's analytics/*.js) — all optional,
+# sensible defaults below. How often the access-log tailer polls for new
+# Traefik log lines, and the resource poller samples container stats, in
+# milliseconds:
+# export ACCESS_LOG_POLL_INTERVAL_MS=5000
+# export RESOURCE_POLL_INTERVAL_MS=60000
+# How long raw analytics rows are kept before being pruned, in days:
+# export ANALYTICS_RETENTION_DAYS=100
+# Where the resource poller reads live CPU/memory from (Docker's own
+# stats API, over its Unix socket — see resource-poller.js's 2026-09-12
+# note on why this replaced Nomad's own stats endpoint). Only set this if
+# Docker's socket lives somewhere non-standard on this host.
+# export DOCKER_SOCKET_PATH=/var/run/docker.sock
+
 # Optional, sensible default — uncomment only to override. How many of an
 # app's most recent local build images deploy-service keeps before
 # pruning older ones (see deploy-service's image-retention.js) — bounds

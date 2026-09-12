@@ -339,7 +339,15 @@ fi
 # ---------------------------------------------------------------------------
 echo "--> Starting BuildKit"
 docker rm -f buildkit >/dev/null 2>&1 || true
-docker run --privileged -d --name buildkit moby/buildkit:v0.30.0
+# --restart unless-stopped: caught during a 2026-09-12 reboot-resilience
+# review, before ever actually rebooting production — a bare `docker run
+# -d` with no restart policy does NOT come back after a host reboot,
+# unlike the Nomad-managed jobs and systemd-enabled services elsewhere in
+# this script, which do. Without this, new builds/deploys would silently
+# fail after any reboot until someone noticed and restarted this container
+# by hand. "unless-stopped" (not "always") so an operator's own deliberate
+# `docker stop buildkit` is still respected rather than immediately undone.
+docker run --privileged -d --restart unless-stopped --name buildkit moby/buildkit:v0.30.0
 
 # Verify it's actually running — if the pinned moby/buildkit image
 # turns out to need Docker Engine features this OS's docker.io version

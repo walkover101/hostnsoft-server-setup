@@ -80,6 +80,19 @@ export MSG91_GENERATE_AUTH_TOKEN_URL="https://routes.msg91.com/api/change_me/gen
 # export CONNECTOR_TOKEN_EXCHANGE_RATE_PER_IP=30
 # export CONNECTOR_TOKEN_VALIDATE_RATE_PER_IP=120
 
+# AI-connector redirect login (GET /auth/msg91/callback's connector
+# branch — see api-service's src/lib/connectorRedirect.ts, merged via PR #10
+# 2026-09-12). Comma-separated allowlist of https:// redirect_uri targets
+# (exact origin + path-prefix match, HTTPS-only) an AI connector is allowed
+# to be redirected back to after MSG91 login — the connector equivalent of
+# a registered OAuth client redirect_uri. Optional — defaults to
+# viasocket's MCP OAuth callback if unset; override/extend only when
+# onboarding another connector platform. Matched by parsed origin +
+# normalized path-prefix (not a raw string prefix check) and HTTPS is
+# enforced regardless — a trailing slash on the path isn't required, the
+# code normalizes it either way.
+# export CONNECTOR_ALLOWED_REDIRECT_PREFIXES="https://mcp.viasocket.com/oauth/"
+
 
 
 # ---------------------------------------------------------------------

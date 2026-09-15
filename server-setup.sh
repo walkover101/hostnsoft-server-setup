@@ -304,6 +304,16 @@ usermod -aG docker "${APP_USER}" || true
 #     Bound to 127.0.0.1 only: never exposed publicly, no ufw rule needed.
 #     Idempotent — apt is a no-op if already installed; config is rewritten
 #     in place and the service restarted on every run.
+#
+#     NOT pinned to a specific version — installed via apt, so the actual
+#     Redis version depends entirely on this Ubuntu release's package
+#     archive (e.g. 22.04 ships 6.0.x, 24.04 ships 7.0.x). Confirmed in
+#     practice: api-service's connectorPendingLogin.ts originally used
+#     GETDEL (added in Redis 6.2) and failed in prod with "ERR unknown
+#     command `GETDEL`" against an older apt-installed Redis — fixed in
+#     that repo by using MULTI GET+DEL instead, which works on any
+#     version. Keep app code Redis-version-agnostic rather than assuming
+#     whatever this apt package happens to install here.
 # ---------------------------------------------------------------------------
 echo "--> Installing Redis"
 if ! command -v redis-server >/dev/null 2>&1; then
@@ -441,6 +451,27 @@ chmod 755 /opt/traefik/logs
 touch /opt/traefik/acme-http.json
 chmod 600 /opt/traefik/acme-http.json
 
+# Router priorities, and why they're this large.
+#
+# Traefik gives a router with no explicit priority a priority equal to its
+# rule's LENGTH. Every customer app's router (hostnsoft-deploy's
+# nomad-job-spec.js) is generated without one, so each sits somewhere
+# around 25-40. The two platform routers below used to be 100 and 1 —
+# numbers chosen only to order them against each OTHER, which left the
+# deploy service at priority 1: below every app router on the host.
+#
+# That only stayed safe because an app's hostname is always
+# <slug>.app.<domain> and can never equal ${DEPLOY_HOST}. The moment apps
+# are served at <slug>.<domain>, an app named after the deploy host would
+# emit Host(`${DEPLOY_HOST}`) at ~25 and outrank the real deploy service —
+# taking over the endpoint agents POST source and deploy tokens to.
+# Traefik matches on the Host header, so DNS doesn't protect this.
+#
+# These are set far above any rule-length-derived value so the platform's
+# own hostnames cannot be captured by a router from the Nomad provider,
+# whatever it's called. This is the floor; the reserved-name list is the
+# other, independent guard. The gap between the two preserves the original
+# intent: /api must still beat the bare host.
 cat > /opt/traefik/dynamic.yml << EOF
 http:
   routers:
@@ -449,7 +480,7 @@ http:
       entryPoints:
         - websecure
       service: ${API_SERVICE_NAME}
-      priority: 100
+      priority: 10100
       middlewares:
         - ${PREFIX}strip-api-prefix
       tls:
@@ -460,7 +491,7 @@ http:
       entryPoints:
         - websecure
       service: ${DEPLOY_SERVICE_NAME}
-      priority: 1
+      priority: 10000
       tls:
         certResolver: cloudflare
 

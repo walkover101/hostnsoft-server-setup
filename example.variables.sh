@@ -47,11 +47,13 @@ export HOSTNSOFT_DEPLOY_URL="https://ship.embarko.ai"
 export MSG91_AUTHKEY="change me"
 export MSG91_GENERATE_AUTH_TOKEN_URL="https://routes.msg91.com/api/change_me/generateAuthToken"
 
-# EDGE_HOSTNAME, ORIGIN_SERVER_IP, INTERNAL_API_SECRET (custom domains —
-# see api-service's docs/Customdomain-req.md) are NOT set here — all
-# three are computed/generated automatically by server-setup.sh itself
-# (see its section 0 and INTERNAL_API_SECRET handling). Do not override
-# them here unless you specifically need to force a different value.
+# EDGE_HOSTNAME, ORIGIN_SERVER_IP, PLATFORM_DOMAIN, INTERNAL_API_SECRET
+# (custom domains — see api-service's docs/Customdomain-req.md) are NOT set
+# here — all four are computed/generated automatically by server-setup.sh
+# itself (see its section 0 and INTERNAL_API_SECRET handling).
+# PLATFORM_DOMAIN becomes $DOMAIN, the zone customers are barred from
+# registering a custom domain inside. Do not override them here unless you
+# specifically need to force a different value.
 
 # Optional — both have sensible defaults, uncomment only to override.
 # How often already-active custom domains get re-checked against live

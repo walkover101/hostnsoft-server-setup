@@ -730,6 +730,17 @@ export APPS_DOMAIN_SUFFIX  # value already computed in section 0 above
 export EDGE_HOSTNAME
 export ORIGIN_SERVER_IP="${SERVER_IP}"
 
+# The platform's own zone — api-service refuses to register any custom
+# domain that is, or sits under, it. Such a name resolves to this origin,
+# so it would pass DNS verification on the IP-match fallback and then take
+# a Traefik router for a platform hostname.
+#
+# $DOMAIN is the bare registrable domain, which is exactly the right value,
+# and this deliberately keeps any explicit setting from variables.sh: it is
+# a security control, so an operator stating it outright should win over
+# anything computed here.
+export PLATFORM_DOMAIN="${PLATFORM_DOMAIN:-$DOMAIN}"
+
 # Anonymous deploys' orphan-proxy sidecar (deploy-service's
 # docs/Anonymous-deploy-req.md #5) — same underlying value as
 # ORIGIN_SERVER_IP above (this box's own address), under the name

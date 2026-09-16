@@ -77,6 +77,44 @@ startup. `server-setup.sh` itself now runs this automatically as part of
 a full re-provision, but this lightweight path doesn't go through that
 script, so it needs the same step done by hand.
 
+## Memory oversubscription — a cluster-wide setting, verify it once
+
+Deployed job specs declare `memory` (the low number Nomad's scheduler
+bin-packs against — 32MB, or 128MB for embedded-DB apps) plus
+`memory_max` (the ceiling a task may actually burst to — 256MB/512MB,
+the same numbers that used to be the single flat reservation). This is
+what lets far more apps fit on one box without them being artificially
+capped: see `deploy-service/nomad-job-spec.js` and
+`docs/Memory-oversubscription-req.md`.
+
+`memory_max` only does anything if oversubscription is enabled
+**cluster-wide**. `server-setup.sh` now does this (step 2, right after
+Nomad starts), so a fresh provision is already correct. But it is a
+setting stored in Nomad's own state, **not** in `nomad.hcl` and not in
+any `.env` — so the lightweight "Deploying code changes" path above
+(`git pull` + `pm2 restart`) never touches it. On any server provisioned
+before this was added, set it by hand, once:
+
+```bash
+nomad operator scheduler set-config -memory-oversubscription=true
+```
+
+Verify (on any server):
+
+```bash
+nomad operator scheduler get-config | grep -i memory
+# Memory Oversubscription = true
+```
+
+This matters because the failure is silent: with it **off**, Nomad still
+accepts the job specs without error, just ignores `memory_max` — so
+every app gets its 32MB floor as a hard cap and starts OOM-killing. If
+apps begin dying shortly after a host rebuild, check this first.
+
+Note it only affects **new** deploys. Apps already running keep the
+old single-`memory` job spec they were deployed with; nothing needs to
+be restarted, and they pick up the new shape on their next deploy.
+
 ## Custom domains — confirming HTTP-01 actually works
 
 Do this once per server, against a real domain you control, before

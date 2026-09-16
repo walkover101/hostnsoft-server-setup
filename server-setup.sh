@@ -262,6 +262,44 @@ EOF
 systemctl enable nomad
 systemctl restart nomad
 
+# Memory oversubscription — a CLUSTER-WIDE scheduler setting, not part of
+# nomad.hcl above and not something a job spec can turn on for itself.
+#
+# deploy-service's generated job specs declare both `memory` (the low
+# number Nomad bin-packs against) and `memory_max` (the ceiling a task may
+# burst to when the host has room) — see hostnsoft-deploy/nomad-job-spec.js
+# and docs/Memory-oversubscription-req.md. With this setting OFF, Nomad
+# still ACCEPTS those jobs but ignores memory_max entirely, which means
+# every app silently gets its low floor (32/128MB) as a HARD cap and starts
+# OOM-killing. It fails quiet, not loud — which is exactly why it belongs
+# in this script rather than staying a one-off manual command someone ran
+# on the live box once.
+#
+# `set-config` only overrides the flags actually passed, leaving the rest
+# of the scheduler config alone, so this is safe to re-run on an existing
+# server (this whole script is meant to be idempotent).
+echo "--> Enabling Nomad memory oversubscription"
+# Needs an elected leader, which isn't instant after the restart above.
+nomad_ready=false
+for _ in $(seq 1 30); do
+  # get-config is the precondition for set-config below (it needs an
+  # elected leader), so probing with it tests exactly the right thing.
+  if nomad operator scheduler get-config >/dev/null 2>&1; then
+    nomad_ready=true
+    break
+  fi
+  sleep 2
+done
+if [[ "$nomad_ready" != true ]]; then
+  echo "ERROR: Nomad did not become ready within 60s; cannot enable memory" >&2
+  echo "       oversubscription. Fix Nomad, then re-run this script (or run" >&2
+  echo "       'nomad operator scheduler set-config -memory-oversubscription=true'" >&2
+  echo "       by hand). Deployed apps will OOM at their scheduling floor until" >&2
+  echo "       this is set." >&2
+  exit 1
+fi
+nomad operator scheduler set-config -memory-oversubscription=true
+
 # ---------------------------------------------------------------------------
 # 3. Docker
 # ---------------------------------------------------------------------------
@@ -720,6 +758,7 @@ echo "--> Generating .env files from each repo's .env.example"
 # would leak the wrong value into whichever one hydrates second.
 export HOSTNSOFT_API_URL="http://127.0.0.1:${API_PORT}"
 export APPS_DOMAIN_SUFFIX  # value already computed in section 0 above
+
 
 # Custom domains (api-service's docs/Customdomain-req.md) — both computed
 # automatically rather than requiring manual values in variables.sh:

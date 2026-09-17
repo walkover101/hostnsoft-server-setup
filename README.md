@@ -42,19 +42,23 @@ branch **named exactly `$APP_ENV`** (`test`, `demo`, or `prod`) — not
 branch, then re-run `sudo -E bash server-setup.sh` on that server (after
 re-sourcing the same `<env>.set-env.sh`/`<env>.variables.sh`).
 
-For a code-only change with no new dependency/env var, skip the full
-re-run — just pull, apply any pending migration, rebuild the orphan-proxy
-sidecar image if it changed, and restart directly on the server:
+For routine code changes, don't re-run `server-setup.sh` — it restarts
+Nomad, Docker and Traefik and takes every customer app down. Use:
 
 ```bash
-cd ~/deploy-service && git pull
-docker build -t orphan-banner-proxy:local orphan-proxy/   # only if orphan-proxy/ exists in this checkout — see below
-pm2 restart <env>-deploy-service
-
-cd ~/api-service && git pull
-npx prisma migrate deploy   # no-op if there's nothing pending — always safe to run
-pm2 restart <env>-api-service
+bash redeploy.sh prod        # or: test | demo
 ```
+
+One script for every environment; the argument picks which
+`<env>.set-env.sh` it reads. It pulls both repos, brings each `.env` up
+to date with the `.env.example` it just pulled, installs dependencies,
+regenerates the Prisma client, builds, applies migrations, rebuilds the
+orphan-proxy sidecar image, and restarts both pm2 processes. It never
+touches Nomad, Docker, Traefik or a running customer app.
+
+Run it as `APP_USER` (no `sudo`) — everything it does works with that
+user's own permissions, and root would leave root-owned files in their
+checkouts.
 
 The `docker build` line matters more than it looks: `nomad-job-spec.js`
 references `orphan-banner-proxy:local` with `force_pull = false`, so
@@ -76,6 +80,87 @@ from a migration that was never applied, rather than failing clearly at
 startup. `server-setup.sh` itself now runs this automatically as part of
 a full re-provision, but this lightweight path doesn't go through that
 script, so it needs the same step done by hand.
+
+## Repairing a damaged `.env` (without re-provisioning)
+
+Each service's `.env` is generated from its own `.env.example` plus the
+values in `<env>.variables.sh` — see `env-hydrate-lib.sh`, which both
+`server-setup.sh` and `redeploy.sh` source, so the two can never
+drift.
+
+`redeploy.sh` does this for you: after pulling, it compares each `.env`
+against its `.env.example` and rebuilds only the ones actually missing a
+key, backing up the old file first. So a commit that introduces a new
+required variable needs no separate step — just redeploy.
+
+To rebuild a `.env` **without** pulling or restarting anything (a
+damaged file on a box you don't want to redeploy yet):
+
+```bash
+cd Server-setup
+source prod.set-env.sh && source prod.variables.sh
+source env-hydrate-lib.sh
+derive_env_vars
+PORT=4000 hydrate_service_env ~/deploy-service deploy-service
+PORT=4100 hydrate_service_env ~/api-service    api-service
+```
+
+Then restart yourself once you've reviewed the result.
+
+Two things it handles that are easy to get wrong by hand:
+
+- **Derived values** (`APPS_DOMAIN_SUFFIX`, `ORIGIN_IP`, `EDGE_HOSTNAME`,
+  `ANALYTICS_DB_PATH`, `APP_DATA_ROOT`, `HOSTNSOFT_API_URL`) are never
+  set in `variables.sh` — they're computed. Rebuilding a `.env` by hand
+  tends to lose exactly these.
+- **`INTERNAL_API_SECRET`** must be IDENTICAL in both services. It is
+  recovered from whichever `.env` still has it rather than regenerated;
+  a fresh value would make every internal call 401. If neither has it,
+  you're warned, and both services must then be hydrated and restarted.
+
+`redeploy.sh` checks this **after** it pulls, so a `.env.example` that
+gained a key in the commit being deployed is caught on that same
+deploy — and it repairs the file rather than refusing. A truncated
+`.env` is invisible while the old config is still in memory, and would
+otherwise surface as a hard outage at the next restart.
+
+### A variable must be UNCOMMENTED in `.env.example` to ever reach `.env`
+
+`hydrate_env_file` substitutes an exported value only into a line that
+matches `KEY=`. A commented line (`# KEY=...`) is copied through as a
+comment and that key **never appears in the generated `.env` at all**.
+
+This bit us for real: `ANALYTICS_DB_PATH` and `TRAEFIK_ACCESS_LOG_PATH`
+sat commented out in deploy-service's `.env.example`, so every single
+hydration produced a `.env` with analytics silently disabled — traffic
+and resource collection just stopped, with only a line in the error log
+to say so. Both are uncommented now (fixed 2026-09-17).
+
+So: if a variable is required at runtime, it belongs in `.env.example`
+uncommented, with the real default as its value. Comment out only things
+that are genuinely optional.
+
+### `INTERNAL_API_SECRET` is reused, never regenerated on an existing box
+
+`<env>.set-env.sh` now looks for an already-deployed secret in
+`~/api-service/.env` (then `~/deploy-service/.env`) before generating
+one, and only generates when neither exists — a brand-new box.
+
+Previously it minted a fresh secret on every source and exported it,
+which also defeated the recovery in `derive_env_vars` (that only looks
+when the variable is unset). Harmless when both services are rebuilt and
+restarted together; a silent 401 on every internal call whenever they
+aren't. If you ever DO see "Generated a NEW INTERNAL_API_SECRET" on a
+box that already has services, stop — something is wrong with the paths,
+and continuing will break api-service ↔ deploy-service calls.
+
+### What `redeploy.sh` deliberately does NOT update
+
+Traefik. `traefik.nomad` is generated and applied only by
+`server-setup.sh`, so a change to Traefik's own flags (for example the
+access-log `User-Agent` capture that bot filtering depends on) needs a
+`server-setup.sh` run — `redeploy.sh` will not pick it up, and nothing
+will warn you. Same for the Nomad scheduler settings below.
 
 ## Memory oversubscription — a cluster-wide setting, verify it once
 

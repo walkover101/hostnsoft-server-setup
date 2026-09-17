@@ -665,76 +665,18 @@ clean_pull() {
   fi
 }
 
-# Builds each repo's real .env from its own .env.example, substituting
-# values from whatever's been exported into this shell (normally sourced
-# from a separate <env>.variables.sh file — see set-env.sh/README) —
-# fully generic, since this script has no built-in knowledge of what
-# app-specific variables either repo actually needs. Each repo's own
-# .env.example is the source of truth for which keys exist; the
-# variables file is the source of truth for real values. A key with no
-# matching override keeps whatever default the example file itself has.
-#
-# ALSO appends any variable listed in variables.sh's own exported
-# APP_VARIABLE_NAMES string (space-separated names) that ISN'T already covered by .env.example —
-# necessary because an example file can be incomplete/stale relative to
-# what the actual code needs (confirmed in practice: a real app required
-# JWT_SECRET, which its own .env.example didn't declare at all — without
-# this, that value would be silently dropped rather than ever reaching
-# the app, even though it was correctly provided in variables.sh).
-hydrate_env_file() {
-  local dir="$1"
-  local example_file="${dir}/.env.example"
-  local target_file="${dir}/.env"
-  declare -A seen_keys=()
-
-  if [[ ! -f "$example_file" ]]; then
-    echo "    No .env.example in ${dir} — starting from an empty .env"
-    > "$target_file"
-  else
-    echo "    Generating .env for ${dir} from .env.example + provided variables"
-    > "$target_file"
-
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*= ]]; then
-        key="${BASH_REMATCH[1]}"
-        seen_keys["$key"]=1
-        override_value="${!key:-}"
-        if [[ -n "$override_value" ]]; then
-          echo "${key}=${override_value}" >> "$target_file"
-        else
-          echo "$line" >> "$target_file"
-        fi
-      else
-        echo "$line" >> "$target_file"
-      fi
-    done < "$example_file"
-  fi
-
-  # Append anything from variables.sh's APP_VARIABLE_NAMES not already
-  # covered above — see comment block preceding this function for why.
-  # APP_VARIABLE_NAMES is an exported space-separated STRING, not an
-  # array — bash arrays can't be exported, so an array set in variables.sh
-  # would never reach this script through `sudo -E`.
-  local extra_names=()
-  read -ra extra_names <<< "${APP_VARIABLE_NAMES:-}"
-  local appended_any=0
-  for name in "${extra_names[@]}"; do
-    if [[ -z "$name" ]]; then
-      continue
-    fi
-    if [[ -z "${seen_keys[$name]:-}" ]]; then
-      value="${!name:-}"
-      if [[ -n "$value" ]]; then
-        if [[ "$appended_any" -eq 0 ]]; then
-          echo "" >> "$target_file"
-          echo "# Appended by server-setup.sh — not present in .env.example" >> "$target_file"
-          appended_any=1
-        fi
-        echo "${name}=${value}" >> "$target_file"
-      fi
-    fi
-  done
-}
+# .env generation lives in env-hydrate-lib.sh, shared with redeploy.sh
+# so the two can never drift. Sourced by path relative to THIS script, not
+# the caller's cwd: this is normally run as `sudo -E bash server-setup.sh`
+# from inside the Server-setup directory, but nothing guarantees that.
+_SETUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "${_SETUP_DIR}/env-hydrate-lib.sh" ]]; then
+  echo "ERROR: ${_SETUP_DIR}/env-hydrate-lib.sh is missing — copy the whole" >&2
+  echo "       Server-setup directory to this box, not just server-setup.sh." >&2
+  exit 1
+fi
+# shellcheck source=env-hydrate-lib.sh
+source "${_SETUP_DIR}/env-hydrate-lib.sh"
 
 echo "--> Pulling ${DEPLOY_SERVICE_NAME} from ${DEPLOY_SERVICE_REPO} (branch: ${APP_ENV})"
 mkdir -p "${APP_HOME}"

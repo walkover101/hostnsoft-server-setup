@@ -81,9 +81,43 @@ fi
 # here, but generating it up front means you see the value before, not
 # only buried in that script's final output.
 # ---------------------------------------------------------------------
+# RECOVER BEFORE GENERATING. This value authenticates api-service ->
+# deploy-service calls, so both services must carry the IDENTICAL string.
+# Generating a fresh one on every source looks harmless — and is, if both
+# .env files are then rebuilt and both processes restarted together — but
+# any path that rebuilds only one service, or restarts only one, leaves
+# the pair mismatched and every internal call 401s. That failure is
+# silent until something actually tries a cross-service call.
+#
+# It also used to defeat the recovery logic in env-hydrate-lib.sh's
+# derive_env_vars, which only looks for an existing secret when the
+# variable is UNSET — an exported fresh value skipped it every time.
+#
+# So: an already-deployed secret wins over a new one. A brand-new box
+# (no .env anywhere) still generates one, which is the only case that
+# should.
+if [[ -z "${INTERNAL_API_SECRET:-}" ]]; then
+  _secret_home="/home/${APP_USER:-ubuntu}"
+  if [[ "${APP_ENV:-prod}" == "prod" ]]; then _secret_prefix=""; else _secret_prefix="${APP_ENV}-"; fi
+  for _candidate in "${_secret_home}/${_secret_prefix}api-service/.env" \
+                    "${_secret_home}/${_secret_prefix}deploy-service/.env"; do
+    if [[ -r "$_candidate" ]]; then
+      _found=$(grep -m1 '^INTERNAL_API_SECRET=' "$_candidate" 2>/dev/null | cut -d= -f2- || true)
+      if [[ -n "$_found" ]]; then
+        export INTERNAL_API_SECRET="$_found"
+        echo "==> Reusing existing INTERNAL_API_SECRET from ${_candidate}"
+        break
+      fi
+    fi
+  done
+  unset _secret_home _secret_prefix _candidate _found
+fi
+
 if [[ -z "${INTERNAL_API_SECRET:-}" ]]; then
   export INTERNAL_API_SECRET="$(openssl rand -hex 32)"
-  echo "==> Generated INTERNAL_API_SECRET: ${INTERNAL_API_SECRET}"
+  echo "==> Generated a NEW INTERNAL_API_SECRET (no existing one found)."
+  echo "    Both services must be hydrated and restarted together, or"
+  echo "    internal calls between them will fail with 401."
 fi
 
 echo ""

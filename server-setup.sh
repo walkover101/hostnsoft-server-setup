@@ -584,6 +584,15 @@ job "traefik" {
           # stdout log isn't something another process can tail.
           "--accesslog.format=json",
           "--accesslog.filepath=/var/log/traefik/access.log",
+          # Keep ONE request header in the access log: User-Agent, which
+          # deploy-service's analytics/bot-filter.js uses to tell a real
+          # visit from a credential scanner. Without it every scan counts
+          # as traffic, and under scale-to-zero an app would be woken to
+          # serve a bot probing for its .env. Named explicitly rather
+          # than keeping all headers — the rest are not needed and some
+          # (Cookie, Authorization) must never be written to disk.
+          "--accesslog.fields.headers.defaultmode=drop",
+          "--accesslog.fields.headers.names.User-Agent=keep",
           "--entrypoints.web.address=:80",
           "--entrypoints.websecure.address=:443",
           "--entrypoints.web.http.redirections.entryPoint.to=websecure",

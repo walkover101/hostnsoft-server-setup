@@ -784,6 +784,19 @@ hydrate_env_file "${APP_HOME}/${DEPLOY_SERVICE_NAME}"
 export PORT="${API_PORT}"
 hydrate_env_file "${APP_HOME}/${API_SERVICE_NAME}"
 
+# PORT was exported per service immediately before each hydrate above, so
+# the LAST value (api-service's) is still in scope here. That matters: the
+# pm2 ecosystem file deliberately does not set PORT, leaving each service
+# to read its own .env — but dotenv does NOT override a variable already
+# present in the environment, and `pm2 start` below inherits this shell.
+# Left set, deploy-service would come up on api-service's port: Traefik
+# then finds nothing on 4000 (502 on the deploy host), routes /api to the
+# wrong process, and api-service crash-loops unable to bind. That is
+# exactly the outage of 2026-09-17, reproduced by provisioning alone.
+#
+# Unset, so each service's own .env is authoritative.
+unset PORT
+
 chown -R "${APP_USER}:${APP_USER}" "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_NAME}" "${APP_HOME}/traefik.nomad"
 
 echo "--> Installing Node.js (direct binary, current LTS — not NodeSource, not pinned to a specific version number)"

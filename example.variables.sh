@@ -55,6 +55,13 @@ export MSG91_GENERATE_AUTH_TOKEN_URL="https://routes.msg91.com/api/change_me/gen
 # registering a custom domain inside. Do not override them here unless you
 # specifically need to force a different value.
 
+# APP_DATA_ROOT (every app's persistent DATA_DIR, one subdirectory per
+# app, bind-mounted into the container at /data) is likewise NOT set here
+# — server-setup.sh computes and creates a per-environment path under
+# /opt/embarko-appdata/. It deliberately lives outside any git checkout,
+# since clean_pull would otherwise erase every app's database on each
+# re-run. Override only if app data must live on a different disk.
+
 # Optional — both have sensible defaults, uncomment only to override.
 # How often already-active custom domains get re-checked against live
 # DNS, in ms. Default: 24h (see api-service's docs/Customdomain-req.md).

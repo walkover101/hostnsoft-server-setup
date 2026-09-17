@@ -80,7 +80,7 @@ script, so it needs the same step done by hand.
 ## Memory oversubscription — a cluster-wide setting, verify it once
 
 Deployed job specs declare `memory` (the low number Nomad's scheduler
-bin-packs against — 32MB, or 128MB for embedded-DB apps) plus
+bin-packs against — 32MB for every app) plus
 `memory_max` (the ceiling a task may actually burst to — 256MB/512MB,
 the same numbers that used to be the single flat reservation). This is
 what lets far more apps fit on one box without them being artificially

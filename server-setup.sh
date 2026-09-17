@@ -801,6 +801,32 @@ mkdir -p "${ANALYTICS_DIR}"
 chown "${APP_USER}:${APP_USER}" "${ANALYTICS_DIR}"
 export ANALYTICS_DB_PATH="${ANALYTICS_DIR}/analytics.db"
 
+# Per-app persistent storage (deploy-service's nomad-job-spec.js) — each
+# app's DATA_DIR is a subdirectory here, bind-mounted into its container
+# at /data.
+#
+# This exists so an app's data is NOT owned by its Nomad allocation.
+# DATA_DIR used to be /alloc/data, which Nomad garbage-collects along
+# with a stopped job (job_gc_threshold, 4h by default) — fine while every
+# app ran forever, fatal the moment anything stops one. A SQLite database
+# would come back empty, and silently, since an app that finds no
+# database usually just creates a fresh one and looks healthy. This is
+# the prerequisite for scale-to-zero.
+#
+# Per-environment, like ANALYTICS_DIR above, so prod/test/demo can never
+# collide on an app name. Created here rather than left to the app so it
+# exists with the right owner before deploy-service ever starts. NOT
+# under any git-managed checkout: clean_pull does `git reset --hard &&
+# git clean -fd` on every re-run, which would erase every app's database.
+#
+# deploy-service chmods each app's own subdirectory to 0777 as it creates
+# it — Railpack images do not all run as root, and a container that
+# cannot write its own data directory fails at runtime rather than at
+# deploy time.
+export APP_DATA_ROOT="/opt/embarko-appdata/${APP_ENV}"
+mkdir -p "${APP_DATA_ROOT}"
+chown "${APP_USER}:${APP_USER}" "${APP_DATA_ROOT}"
+
 export PORT="${DEPLOY_PORT}"
 hydrate_env_file "${APP_HOME}/${DEPLOY_SERVICE_NAME}"
 

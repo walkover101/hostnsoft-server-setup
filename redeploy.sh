@@ -51,6 +51,19 @@ fi
 if [[ "$APP_ENV" == "prod" ]]; then PREFIX=""; else PREFIX="${APP_ENV}-"; fi
 DEPLOY_SERVICE_NAME="${PREFIX}deploy-service"
 API_SERVICE_NAME="${PREFIX}api-service"
+
+# Same offsets server-setup.sh uses (its section 0) — these MUST stay
+# identical or a hydrate here would write a port the Traefik routes
+# generated there never point at. Referenced below when hydrating, and
+# previously undefined in this script: that only escaped notice because
+# the hydrate branch is conditional and had not fired yet.
+case "$APP_ENV" in
+  prod) PORT_OFFSET=0 ;;
+  test) PORT_OFFSET=1000 ;;
+  demo) PORT_OFFSET=2000 ;;
+esac
+DEPLOY_PORT=$((4000 + PORT_OFFSET))
+API_PORT=$((4100 + PORT_OFFSET))
 PM2_DEPLOY_NAME="${APP_ENV}-deploy-service"
 PM2_API_NAME="${APP_ENV}-api-service"
 APP_HOME="${APP_HOME:-/home/${APP_USER}}"
@@ -95,12 +108,27 @@ for spec in "${DEPLOY_DIR}:deploy-service" "${API_DIR}:api-service"; do
   dir="${spec%%:*}"; label="${spec##*:}"
   [[ -d "$dir" ]] || continue
   missing="$(env_missing_keys "$dir")"
+
+  # A present-but-WRONG value is invisible to the missing-key check, and
+  # PORT is the one where that is catastrophic rather than cosmetic: the
+  # two services must bind the two ports Traefik's routes point at, or
+  # ship.embarko.ai 502s, /api reaches the wrong process, and the loser
+  # crash-loops unable to bind. That is exactly what happened on
+  # 2026-09-17, when a global `export PORT=4100` in variables.sh put
+  # api-service's port into deploy-service's .env. Verified explicitly
+  # here so a redeploy REPAIRS it instead of restarting into it.
+  if [[ "$label" == "deploy-service" ]]; then expected_port="$DEPLOY_PORT"; else expected_port="$API_PORT"; fi
+  actual_port="$(grep -m1 '^PORT=' "${dir}/.env" 2>/dev/null | cut -d= -f2- || true)"
+
   if [[ -n "$missing" ]]; then
     echo "--> ${label}: .env is missing key(s) from .env.example:"
     printf '      %s\n' $missing
     NEEDS_HYDRATE+=("$spec")
+  elif [[ "$actual_port" != "$expected_port" ]]; then
+    echo "--> ${label}: .env has PORT=${actual_port:-<unset>}, expected ${expected_port} — rebuilding"
+    NEEDS_HYDRATE+=("$spec")
   else
-    echo "--> ${label}: .env already has every key from .env.example"
+    echo "--> ${label}: .env has every key, and PORT=${actual_port}"
   fi
 done
 
@@ -144,7 +172,12 @@ fi
 # require() from this commit crashes the process even though the pull
 # itself was clean.
 echo "--> Installing dependencies"
-npm install
+# --include=dev, not a bare install: if NODE_ENV=production is exported
+# (it was, globally, in variables.sh), npm omits devDependencies and
+# strips typescript — so `npm run build` dies with "tsc: not found" and
+# this script aborts BEFORE restarting anything. Explicit here so the
+# build cannot break again on whatever NODE_ENV happens to be set.
+npm install --include=dev
 
 # Generic detection rather than hardcoding which service compiles: a pull
 # only updates source, so for a compiled service the restart re-executes
@@ -156,6 +189,17 @@ if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; the
 fi
 
 echo "--> Restarting ${PM2_DEPLOY_NAME}"
+# PORT is set explicitly here, immediately before the restart, and NOT
+# left to .env. `--update-env` hands pm2 this shell's environment, and
+# dotenv does NOT override a variable that is already set — so any stale
+# PORT exported in the operator's shell (for example from sourcing an
+# older variables.sh) silently wins over the correct value in .env. That
+# is precisely how deploy-service ended up bound to api-service's port on
+# 2026-09-17 even after .env had been corrected: the file was right and
+# the process still came up wrong.
+#
+# Setting it per service here makes the inherited value irrelevant.
+export PORT="$DEPLOY_PORT"
 pm2 restart "${PM2_DEPLOY_NAME}" --update-env
 
 # ---------------------------------------------------------------------
@@ -164,7 +208,12 @@ pm2 restart "${PM2_DEPLOY_NAME}" --update-env
 cd "$API_DIR"
 
 echo "--> Installing dependencies"
-npm install
+# --include=dev, not a bare install: if NODE_ENV=production is exported
+# (it was, globally, in variables.sh), npm omits devDependencies and
+# strips typescript — so `npm run build` dies with "tsc: not found" and
+# this script aborts BEFORE restarting anything. Explicit here so the
+# build cannot break again on whatever NODE_ENV happens to be set.
+npm install --include=dev
 
 # npm install only regenerates the Prisma Client via @prisma/client's
 # postinstall, which fires only when npm actually installs something. A
@@ -190,6 +239,8 @@ if [[ -f "${API_DIR}/prisma/schema.prisma" ]]; then
 fi
 
 echo "--> Restarting ${PM2_API_NAME}"
+# Same reasoning as the deploy-service restart above.
+export PORT="$API_PORT"
 pm2 restart "${PM2_API_NAME}" --update-env
 
 echo "=================================================================="

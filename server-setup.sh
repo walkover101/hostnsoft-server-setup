@@ -117,6 +117,11 @@ DEPLOY_SERVICE_NAME="${PREFIX}deploy-service"
 API_SERVICE_NAME="${PREFIX}api-service"
 DEPLOY_PORT=$((4000 + PORT_OFFSET))
 API_PORT=$((4100 + PORT_OFFSET))
+# The scale-to-zero activator (deploy-service/activator.js). Same offset
+# scheme as the two above so test/demo/prod can share a box without
+# colliding. Bound to 127.0.0.1 only — it is reached exclusively through
+# Traefik, never directly.
+ACTIVATOR_PORT=$((4200 + PORT_OFFSET))
 
 # pm2 process names ALWAYS carry the APP_ENV prefix, even for prod —
 # deliberately separate from DEPLOY_SERVICE_NAME/API_SERVICE_NAME above
@@ -126,6 +131,7 @@ API_PORT=$((4100 + PORT_OFFSET))
 # affects how processes are labeled in `pm2 list`.
 PM2_DEPLOY_NAME="${APP_ENV}-deploy-service"
 PM2_API_NAME="${APP_ENV}-api-service"
+PM2_ACTIVATOR_NAME="${APP_ENV}-activator"
 
 DEPLOY_HOST="${DEPLOY_SUBDOMAIN}.${DOMAIN_ENV_SEGMENT}${DOMAIN}"
 APPS_DOMAIN_SUFFIX="${APPS_SUBDOMAIN_BASE}.${DOMAIN_ENV_SEGMENT}${DOMAIN}"
@@ -140,6 +146,7 @@ EDGE_HOSTNAME="edge.${DOMAIN_ENV_SEGMENT}${DOMAIN}"
 echo "=================================================================="
 echo " Provisioning — environment: ${APP_ENV}"
 echo " deploy-service   : ${DEPLOY_SERVICE_NAME}  (port ${DEPLOY_PORT})"
+echo " activator        : ${PM2_ACTIVATOR_NAME}  (port ${ACTIVATOR_PORT}, scale-to-zero)"
 echo " api-service      : ${API_SERVICE_NAME}  (port ${API_PORT})"
 echo " Deploy API host  : https://${DEPLOY_HOST}/apps"
 echo " api-service      : https://${DEPLOY_HOST}/api (internal-only otherwise)"
@@ -254,6 +261,29 @@ plugin "docker" {
     allow_privileged = true
     volumes {
       enabled = true
+    }
+
+    # Nomad's docker driver garbage collects images by default
+    # (gc.image = true, image_delay = "3m"): once the last allocation
+    # referencing an image is collected, it deletes the image itself.
+    #
+    # That is fatal to scale-to-zero. App images are built locally by
+    # railpack and pushed to NO registry, and job specs reference them
+    # with force_pull = false — so an image Nomad deletes is gone for
+    # good. Stopping an idle app therefore destroyed the only copy of its
+    # image three minutes later, and waking it failed with "pull access
+    # denied ... repository does not exist", which reads like a registry
+    # auth problem and is nothing of the sort. Diagnosed exactly that way
+    # on 2026-09-18 against scale-to-zero-test-1.
+    #
+    # Turned off rather than given a longer image_delay: deploy-service
+    # already owns image lifecycle end to end — pruneOldImages() keeps
+    # IMAGE_RETAIN_COUNT versions per app after each deploy, and teardown
+    # removes an app's images when it is deleted. Nomad's GC was a second,
+    # uncoordinated policy on top of that, which is also why rollback to
+    # an older imageTag could find its image missing.
+    gc {
+      image = false
     }
   }
 }
@@ -395,7 +425,23 @@ docker rm -f buildkit >/dev/null 2>&1 || true
 # fail after any reboot until someone noticed and restarted this container
 # by hand. "unless-stopped" (not "always") so an operator's own deliberate
 # `docker stop buildkit` is still respected rather than immediately undone.
-docker run --privileged -d --restart unless-stopped --name buildkit moby/buildkit:v0.30.0
+#
+# -v buildkit-cache:/var/lib/buildkit: BuildKit's entire layer cache lives
+# in that path INSIDE the container, so the `docker rm -f` above used to
+# destroy it on every run of this script — making the next build of every
+# app a cold, from-scratch one. Measured on 2026-09-18: app build times
+# roughly doubled (to 4-5 minutes) immediately after a re-provision, with
+# nothing else changed. A NAMED volume survives container removal, so the
+# container stays disposable (which is what makes this script re-runnable)
+# while the cache does not.
+#
+# Not a bind mount: the cache is BuildKit's private format, nothing else
+# reads it, and a named volume needs no host path to exist or be chowned.
+# BuildKit runs its own periodic GC inside the volume, so this grows to a
+# bounded size rather than forever.
+docker run --privileged -d --restart unless-stopped --name buildkit \
+  -v buildkit-cache:/var/lib/buildkit \
+  moby/buildkit:v0.30.0
 
 # Verify it's actually running — if the pinned moby/buildkit image
 # turns out to need Docker Engine features this OS's docker.io version
@@ -533,6 +579,37 @@ http:
       tls:
         certResolver: cloudflare
 
+    # --- scale-to-zero wake-on-request (plan Step 4) ---------------------
+    #
+    # A STOPPED app has no Traefik router at all: app routers come from
+    # the Nomad provider, which only sees RUNNING services. Its hostname
+    # would simply 404. This fallback router catches that hostname and
+    # hands it to deploy-service/activator.js, which starts the job, waits
+    # for it, and forwards the original request.
+    #
+    # priority: 1 is the whole mechanism. App routers set no explicit
+    # priority, so Traefik derives theirs from the rule's length (~44 for
+    # a Host rule) — any running app therefore outranks this by a wide
+    # margin and its traffic never touches the activator. The instant the
+    # job stops and its router disappears, this becomes the only match.
+    #
+    # ONE router per app, by exact hostname, never a wildcard: that is
+    # what makes "no other app's traffic can reach the activator" a fact
+    # about this file rather than a hope about its code. The app names
+    # here MUST match WAKEABLE_APPS in activator.js — an app routed here
+    # but not in that list gets a 404 instead of a wake, and an app in
+    # that list with no router here is never woken because nothing ever
+    # reaches the activator. Step 6/7 is where this stops being hand-
+    # maintained.
+    ${PREFIX}wake-scale-to-zero-test-1:
+      rule: "Host(\`scale-to-zero-test-1.${APPS_DOMAIN_SUFFIX}\`)"
+      entryPoints:
+        - websecure
+      service: ${PREFIX}scale-to-zero-activator
+      priority: 1
+      tls:
+        certResolver: cloudflare
+
   middlewares:
     ${PREFIX}strip-api-prefix:
       stripPrefix:
@@ -540,6 +617,11 @@ http:
           - "/api"
 
   services:
+    ${PREFIX}scale-to-zero-activator:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:${ACTIVATOR_PORT}"
+
     ${DEPLOY_SERVICE_NAME}:
       loadBalancer:
         servers:
@@ -600,6 +682,19 @@ job "traefik" {
           "--providers.nomad=true",
           "--providers.nomad.endpoint.address=http://127.0.0.1:4646",
           "--providers.nomad.exposedByDefault=false",
+          # Default is 15s. That interval is a BLACKOUT WINDOW for
+          # scale-to-zero: between an app being stopped and Traefik
+          # noticing, Traefik still holds that app's own router pointing
+          # at a dead allocation, so requests get a fast 502 instead of
+          # falling through to the priority-1 activator router that would
+          # have woken it. Measured on 2026-09-18 — 10 requests sent
+          # seconds after a stop all failed without the activator ever
+          # being invoked.
+          #
+          # 5s shortens the window rather than closing it; nothing here
+          # can make Traefik's view of a stopped job instantaneous. The
+          # poll is against Nomad's local API and is cheap.
+          "--providers.nomad.refreshInterval=5s",
           "--providers.file.filename=/etc/traefik/dynamic.yml",
           "--certificatesresolvers.cloudflare.acme.dnschallenge=true",
           "--certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare",
@@ -951,6 +1046,23 @@ module.exports = {
       args: 'start',
       env: {
         BUILDKIT_HOST: 'docker-container://buildkit',
+      },
+    },
+    {
+      // scale-to-zero activator — see deploy-service/activator.js and
+      // docs/scale-to-zero-gated-plan.md Step 4. Runs from the
+      // deploy-service checkout (it reuses that service's .env and its
+      // nomad-job-spec helpers) but as its OWN process: it sits in the
+      // path of real visitor traffic and holds connections open for the
+      // length of a cold start, which must never be able to take
+      // deploy-service's API down with it.
+      //
+      // script, not 'npm start': that would run deploy-service itself.
+      name: '${PM2_ACTIVATOR_NAME}',
+      cwd: '${APP_HOME}/${DEPLOY_SERVICE_NAME}',
+      script: 'activator.js',
+      env: {
+        ACTIVATOR_PORT: '${ACTIVATOR_PORT}',
       },
     },
   ],

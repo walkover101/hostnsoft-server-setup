@@ -251,3 +251,50 @@ What you need to run this: a real domain (or subdomain) you control DNS
 for, and the server already provisioned via `server-setup.sh` (ports
 80/443 open, both in `ufw` and in your cloud provider's security group —
 see the big warning `server-setup.sh` prints about this).
+
+## Scale-to-zero: the activator needs a `server-setup.sh` run
+
+`deploy-service/activator.js` wakes an app that scale-to-zero stopped.
+Two pieces of it live here, and they are BOTH things `redeploy.sh`
+deliberately cannot do:
+
+- a per-app **fallback router** in `/opt/traefik/dynamic.yml`, at
+  `priority: 1`, pointing that app's hostname at the activator;
+- the **`<env>-activator` pm2 process**, added to `ecosystem.config.js`
+  on port `4200 + PORT_OFFSET`, bound to `127.0.0.1`.
+
+`redeploy.sh` restarts the activator (and starts it if a box predates it)
+but never writes `dynamic.yml` — that file is root-owned under
+`/opt/traefik` and only `server-setup.sh` generates it. So enabling
+scale-to-zero on a server, or adding an app to it, needs:
+
+```bash
+source prod.set-env.sh && source prod.variables.sh
+sudo -E bash server-setup.sh
+```
+
+which restarts Nomad, Docker and Traefik and briefly drops every customer
+app. After that first run, ordinary code changes to the activator ship
+with `bash redeploy.sh prod` like anything else.
+
+### Why `priority: 1` is the whole mechanism
+
+App routers are created by Traefik's **Nomad provider**, which only sees
+**running** services — a stopped app has no router and its hostname
+returns a bare 404. The fallback router in `dynamic.yml` matches the same
+hostname, so Traefik has to choose, and it picks the highest priority.
+App routers set none, so Traefik derives theirs from the rule's length
+(~44 for a `Host(...)` rule), which beats 1 by a wide margin. A running
+app's traffic therefore never reaches the activator at all; the fallback
+only wins in the window where the real router doesn't exist.
+
+One router per app, by exact hostname — never a wildcard. That is what
+makes "no other app's traffic can reach the activator" a property of this
+file rather than a hope about the activator's code.
+
+**The app list is hand-maintained in two places and they must agree**:
+the routers generated here, and `WAKEABLE_APPS` in `activator.js`. An app
+routed here but missing from that list gets a 404 instead of a wake; an
+app in that list with no router here is never woken, because nothing ever
+reaches the activator. Step 6/7 of the plan is where this stops being
+manual.

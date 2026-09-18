@@ -66,6 +66,8 @@ DEPLOY_PORT=$((4000 + PORT_OFFSET))
 API_PORT=$((4100 + PORT_OFFSET))
 PM2_DEPLOY_NAME="${APP_ENV}-deploy-service"
 PM2_API_NAME="${APP_ENV}-api-service"
+PM2_ACTIVATOR_NAME="${APP_ENV}-activator"
+ACTIVATOR_PORT=$((4200 + PORT_OFFSET))
 APP_HOME="${APP_HOME:-/home/${APP_USER}}"
 DEPLOY_DIR="${APP_HOME}/${DEPLOY_SERVICE_NAME}"
 API_DIR="${APP_HOME}/${API_SERVICE_NAME}"
@@ -201,6 +203,34 @@ echo "--> Restarting ${PM2_DEPLOY_NAME}"
 # Setting it per service here makes the inherited value irrelevant.
 export PORT="$DEPLOY_PORT"
 pm2 restart "${PM2_DEPLOY_NAME}" --update-env
+
+# ---------------------------------------------------------------------
+# 3b. scale-to-zero activator (deploy-service/activator.js).
+#
+# Same checkout and the same .env as deploy-service, but its own process,
+# so it restarts here alongside the code it was pulled with. Started
+# rather than restarted when it isn't running yet: every box provisioned
+# before Step 4 existed has no such pm2 process, and a bare `pm2 restart`
+# would fail under `set -e` and abort the redeploy AFTER deploy-service
+# had already been restarted — the worst place to stop.
+#
+# PORT is not exported for it. It reads ACTIVATOR_PORT, and leaving
+# DEPLOY_PORT in the environment is harmless only because of that; the
+# explicit export below removes the need to rely on it.
+# ---------------------------------------------------------------------
+if [[ -f "${DEPLOY_DIR}/activator.js" ]]; then
+  export ACTIVATOR_PORT
+  if pm2 describe "${PM2_ACTIVATOR_NAME}" >/dev/null 2>&1; then
+    echo "--> Restarting ${PM2_ACTIVATOR_NAME}"
+    pm2 restart "${PM2_ACTIVATOR_NAME}" --update-env
+  else
+    echo "--> ${PM2_ACTIVATOR_NAME} is not running yet — starting it"
+    pm2 start "${DEPLOY_DIR}/activator.js" --name "${PM2_ACTIVATOR_NAME}" --cwd "${DEPLOY_DIR}"
+    pm2 save
+  fi
+else
+  echo "--> No activator.js in this checkout — skipping ${PM2_ACTIVATOR_NAME}"
+fi
 
 # ---------------------------------------------------------------------
 # 4. api-service — dependencies, Prisma, build, migrations, restart.

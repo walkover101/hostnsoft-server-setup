@@ -123,6 +123,22 @@ API_PORT=$((4100 + PORT_OFFSET))
 # Traefik, never directly.
 ACTIVATOR_PORT=$((4200 + PORT_OFFSET))
 
+# How long an app must go without a real (non-bot) request before the idle
+# watcher may stop it. Defaulted here rather than required in
+# <env>.variables.sh so an older variables file still provisions.
+#
+# 360 minutes = 6 hours. The number is chosen around the cost of STOPPING,
+# not the cost of waking: waking is graceful (~5s, the visitor gets a slow
+# page and then correct content), but for the few seconds after a stop
+# Traefik still routes to the dead allocation and a request gets a hard
+# 502. So what matters is how OFTEN an app stops, not how long it stays
+# stopped. Working-day gaps run 4-6 hours, so a shorter threshold makes
+# apps cycle during office hours, putting those 502 windows exactly where
+# people are; 6 hours pushes almost every stop into the night, when the
+# same window is very unlikely to be hit by anyone. See
+# docs/scale-to-zero-gated-plan.md Step 5.
+IDLE_THRESHOLD_MIN="${IDLE_THRESHOLD_MIN:-360}"
+
 # pm2 process names ALWAYS carry the APP_ENV prefix, even for prod —
 # deliberately separate from DEPLOY_SERVICE_NAME/API_SERVICE_NAME above
 # (which stay bare-for-prod, used for directories/domains/Traefik, since
@@ -1076,6 +1092,65 @@ sudo -u "${APP_USER}" bash -c "
   pm2 save
 "
 env PATH=$PATH:/usr/bin pm2 startup systemd -u "${APP_USER}" --hp "${APP_HOME}" || true
+
+# ---------------------------------------------------------------------------
+# 9b. Scale-to-zero idle watcher — a systemd timer, not cron.
+#
+# Step 5 of docs/scale-to-zero-gated-plan.md: idle detection has to run on
+# a schedule rather than by hand. A timer rather than cron for two reasons
+# that matter here — the run's output lands in the journal where it can
+# actually be read afterwards, and Persistent=true means a run missed
+# while the box was down happens at boot instead of being silently
+# skipped.
+#
+# Runs as APP_USER, never root. idle-report.js opens the analytics
+# database read-write (it sets WAL mode), so a root run would leave
+# root-owned -wal/-shm files beside a ubuntu-owned database and break the
+# running service's ability to write to it.
+#
+# SAFETY: this timer can only ever stop an app named in STOPPABLE_APPS, a
+# frozen list hardcoded in idle-report.js. Putting it on a schedule does
+# NOT widen what it may touch — every other idle app is reported and left
+# running, which is exactly what makes scheduling it safe at this stage.
+#
+# IDLE_THRESHOLD_MIN comes from <env>.variables.sh. That value is the
+# PRODUCTION threshold; the Step 5 soak overrides it with something much
+# shorter, via scale-to-zero-soak.sh, to force many cycles per day.
+# ---------------------------------------------------------------------------
+IDLE_WATCHER_UNIT="embarko-idle-${APP_ENV}"
+echo "--> Installing scale-to-zero idle watcher timer '${IDLE_WATCHER_UNIT}' (threshold: ${IDLE_THRESHOLD_MIN} min)"
+
+write_idle_watcher_units() {
+  cat > "/etc/systemd/system/${IDLE_WATCHER_UNIT}.service" << EOF
+[Unit]
+Description=Embarko scale-to-zero idle watcher (${APP_ENV})
+After=network.target
+
+[Service]
+Type=oneshot
+User=${APP_USER}
+WorkingDirectory=${APP_HOME}/${DEPLOY_SERVICE_NAME}
+Environment=IDLE_THRESHOLD_MIN=${IDLE_THRESHOLD_MIN}
+ExecStart=/usr/local/bin/node ${APP_HOME}/${DEPLOY_SERVICE_NAME}/idle-report.js --apply
+EOF
+
+  cat > "/etc/systemd/system/${IDLE_WATCHER_UNIT}.timer" << EOF
+[Unit]
+Description=Run the Embarko scale-to-zero idle watcher every 10 minutes (${APP_ENV})
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+write_idle_watcher_units
+systemctl daemon-reload
+systemctl enable --now "${IDLE_WATCHER_UNIT}.timer"
 
 # ---------------------------------------------------------------------------
 # 10. DNS — done manually, not by this script. See README.md for the

@@ -79,7 +79,15 @@ echo " URL      : ${TEST_URL}"
 echo " Threshold: 15 min (overridden; production value is restored by --remove)"
 echo "=================================================================="
 
-if ! systemctl list-unit-files | grep -q "^${IDLE_UNIT}.timer"; then
+# `systemctl cat`, NOT `systemctl list-unit-files | grep -q`. Under
+# `set -o pipefail`, `grep -q` exiting the instant it matches closes the
+# pipe, the still-writing upstream command takes SIGPIPE and exits 141,
+# and the PIPELINE reports 141 — so a successful match reads as a failure.
+# list-unit-files emits hundreds of lines and this unit sorts early, so
+# grep bails almost immediately with plenty left to write. That made this
+# check fail intermittently and then permanently (2026-09-18), reporting
+# a timer that was installed and running as missing.
+if ! systemctl cat "${IDLE_UNIT}.timer" >/dev/null 2>&1; then
   echo "ERROR: ${IDLE_UNIT}.timer is not installed. Run server-setup.sh first." >&2
   exit 1
 fi
@@ -124,7 +132,19 @@ cat > "/etc/systemd/system/${SOAK_UNIT}.timer" << EOF
 Description=Request ${TEST_APP} every 45 minutes to exercise wake-on-request (${APP_ENV})
 
 [Timer]
-OnBootSec=5min
+# OnActiveSec, NOT OnBootSec: OnBootSec is measured from BOOT, so on a box
+# that booted days ago its deadline is permanently in the past and never
+# produces a future trigger. Combined with the OnUnitInactiveSec below —
+# which needs a run inside THIS timer unit's lifetime to chain from, and
+# has none on a freshly installed unit — the timer ends up with no next
+# elapse at all: `systemctl list-timers` shows "n/a" and it never fires.
+# Seen exactly that way on 2026-09-18, including after a reinstall, since
+# removing the unit wipes systemd's record of the earlier run (the journal
+# line survives, which makes it look like the timer is still anchored).
+#
+# OnActiveSec is relative to when the TIMER starts, so installing it always
+# produces a first run, whether that is now or at boot.
+OnActiveSec=1min
 # OnUnitInactiveSec, NOT OnUnitActiveSec: this service is Type=oneshot and
 # a single run can last up to 150s (it holds the connection through a cold
 # start). OnUnitActiveSec measures from the moment the unit went active,
@@ -135,7 +155,6 @@ OnBootSec=5min
 # interval its intended meaning: 45 minutes of genuine idleness after a
 # request, comfortably past the 15-minute threshold.
 OnUnitInactiveSec=45min
-Persistent=true
 
 [Install]
 WantedBy=timers.target

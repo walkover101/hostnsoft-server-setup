@@ -409,7 +409,13 @@ sed -i -E 's/^#? *protected-mode .*/protected-mode yes/' /etc/redis/redis.conf
 sed -i -E 's/^#? *supervised .*/supervised systemd/' /etc/redis/redis.conf
 systemctl enable redis-server
 systemctl restart redis-server
-if ! redis-cli ping | grep -q PONG; then
+# Command substitution, not `| grep -q`: under `set -o pipefail` a grep -q
+# that matches early closes the pipe, the upstream command takes SIGPIPE
+# and exits 141, and the pipeline reports that 141 as the result — so a
+# successful match can read as a failure. Unlikely with output this small,
+# but the same construct broke scale-to-zero-soak.sh for real on
+# 2026-09-18, so it is not left in place anywhere.
+if [[ "$(redis-cli ping 2>/dev/null)" != "PONG" ]]; then
   echo "ERROR: Redis did not respond to PING after restart." >&2
   journalctl -xeu redis-server --no-pager | tail -20 >&2
   exit 1
@@ -465,7 +471,9 @@ docker run --privileged -d --restart unless-stopped --name buildkit \
 # failure surfacing confusingly later as "railpack build" mysteriously
 # can't connect to BuildKit during an actual app deploy.
 sleep 2
-if ! docker ps --filter name=buildkit --filter status=running -q | grep -q .; then
+# Command substitution rather than `| grep -q .` — same pipefail/SIGPIPE
+# reasoning as the redis check above.
+if [[ -z "$(docker ps --filter name=buildkit --filter status=running -q)" ]]; then
   echo "ERROR: BuildKit container failed to start or exited immediately." >&2
   echo "This may mean the installed Docker Engine version is too old for" >&2
   echo "the pinned moby/buildkit:v0.30.0 image. Check what's actually" >&2
@@ -1139,9 +1147,16 @@ EOF
 Description=Run the Embarko scale-to-zero idle watcher every 10 minutes (${APP_ENV})
 
 [Timer]
-OnBootSec=10min
+# OnActiveSec (relative to when the TIMER starts), not OnBootSec (relative
+# to BOOT): on a box that booted days ago an OnBootSec deadline is already
+# in the past and yields no future trigger, leaving the timer dependent on
+# OnUnitActiveSec having a previous run to chain from — which a freshly
+# installed unit does not have. The result is a timer with no next elapse
+# that silently never fires. The soak timer hit exactly this on
+# 2026-09-18; this one happened to escape it only because its service had
+# already run under the same unit.
+OnActiveSec=2min
 OnUnitActiveSec=10min
-Persistent=true
 
 [Install]
 WantedBy=timers.target

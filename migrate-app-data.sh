@@ -60,6 +60,24 @@ for tool in jq rsync curl; do
   command -v "$tool" >/dev/null || { echo "ERROR: $tool is required." >&2; exit 1; }
 done
 
+# The allocation directories are root-owned and mode 0700. Every read of
+# them below swallows its own errors (`2>/dev/null`, `|| true`) so that a
+# genuinely-absent directory reads as "nothing to migrate" — which means
+# an UNREADABLE one reads exactly the same way. Run without sudo, this
+# script would report every app as having no data and exit cleanly.
+#
+# For a migration audit that is the worst failure available: a confident
+# all-clear over stranded customer data. Checked explicitly, up front, and
+# fatal — a dry run that cannot see the source is worse than no dry run,
+# because it is believed.
+if [[ ! -r "${NOMAD_DATA_DIR}/alloc" ]] || ! ls -A "${NOMAD_DATA_DIR}/alloc" >/dev/null 2>&1; then
+  echo "ERROR: cannot read ${NOMAD_DATA_DIR}/alloc — re-run with sudo." >&2
+  echo "       Allocation directories are root-owned (0700). Without read" >&2
+  echo "       access every app would be reported as having no data to" >&2
+  echo "       migrate, which is indistinguishable from a genuine all-clear." >&2
+  exit 1
+fi
+
 echo "=================================================================="
 echo " App data migration — mode: ${MODE}"
 echo " Source : ${NOMAD_DATA_DIR}/alloc/<allocID>/alloc/data"
@@ -67,7 +85,11 @@ echo " Dest   : ${APP_DATA_ROOT}/<appName>"
 echo "=================================================================="
 echo ""
 
-mkdir -p "${APP_DATA_ROOT}"
+# Not in dry-run: an audit should touch nothing at all, so that "I only
+# ran the dry run" is a complete statement about what happened.
+if [[ "$MODE" == "copy" ]]; then
+  mkdir -p "${APP_DATA_ROOT}"
+fi
 
 # A file-level fingerprint, so "it copied" is proven rather than assumed:
 # a matching file count and byte total would still pass if content were
@@ -100,6 +122,28 @@ for app in "${APPS[@]}"; do
   alloc_id=$(current_alloc_id "$app")
   if [[ -z "$alloc_id" ]]; then
     printf '%-28s  no running allocation — SKIPPED\n' "$app"
+    skipped=$((skipped+1)); continue
+  fi
+
+  # An app ALREADY on the bind mount is not a migration candidate, and
+  # treating it as one is actively dangerous. Its allocation directory
+  # still holds whatever it wrote before the switch — stale by definition,
+  # because everything since has gone to the destination. Copying that
+  # over the live data is not "re-running a migration", it is restoring an
+  # old backup on top of current data.
+  #
+  # For SQLite it is worse than losing rows: an old -wal written over a
+  # newer .db is a mismatched pair, which can corrupt the database rather
+  # than merely roll it back.
+  #
+  # `focus` was exactly this case on 2026-09-18 — migrated, live data at
+  # the destination (222512-byte WAL, Sep 17), five-day-old leftovers in
+  # the allocation (201912 bytes, Sep 12) — and it was being listed as
+  # needing migration.
+  data_dir=$(curl -sf "${NOMAD_ADDR}/v1/job/$(printf '%s' "$app" | jq -sRr @uri)" \
+    | jq -r '[.TaskGroups[].Tasks[] | select(.Name=="server") | .Env.DATA_DIR] | first // empty')
+  if [[ "$data_dir" == "/data" ]]; then
+    printf '%-28s  already on the bind mount — nothing to migrate\n' "$app"
     skipped=$((skipped+1)); continue
   fi
 
@@ -140,6 +184,25 @@ for app in "${APPS[@]}"; do
     migrated=$((migrated+1)); continue
   fi
 
+  # Backstop against --force pointed the wrong way. --force exists for the
+  # legitimate case of picking up a delta after stopping an app, where the
+  # source is the newer copy. If the DESTINATION is newer, the same
+  # command means the opposite thing: overwriting current data with an
+  # older copy. The flag cannot distinguish those; the timestamps can.
+  #
+  # rsync -a has no notion of this on its own — it copies source over
+  # destination regardless of which is newer.
+  newest() { find "$1" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1; }
+  if [[ -d "$dest" ]]; then
+    src_newest=$(newest "$src"); dest_newest=$(newest "$dest")
+    if [[ -n "$src_newest" && -n "$dest_newest" ]] \
+       && awk "BEGIN{exit !($dest_newest > $src_newest)}"; then
+      printf '%-28s  REFUSED — destination is NEWER than the allocation copy\n' "$app"
+      printf '%-28s     copying would overwrite current data with an older one\n' ""
+      needs_attention=$((needs_attention+1)); continue
+    fi
+  fi
+
   mkdir -p "$dest"
   # -a preserves timestamps/permissions; --delete is deliberately NOT
   # used, so this can never remove anything at the destination.
@@ -165,7 +228,11 @@ echo ""
 echo "=================================================================="
 case "$MODE" in
   dry-run) echo " DRY RUN — nothing was copied. ${migrated} app(s) would migrate, ${skipped} skipped." ;;
-  copy)    echo " ${migrated} migrated, ${skipped} skipped, ${failed} FAILED." ;;
+  # needs_attention is reported here too, not just in verify mode: copy
+  # mode can now REFUSE an app (destination newer than source), and a
+  # refusal that appeared only as a line scrolled past — absent from the
+  # summary anyone actually reads — would look like a clean run.
+  copy)    echo " ${migrated} migrated, ${skipped} skipped, ${needs_attention} refused, ${failed} FAILED." ;;
   verify)  echo " ${needs_attention} app(s) need attention." ;;
 esac
 echo " Source allocation directories were NOT modified or deleted."

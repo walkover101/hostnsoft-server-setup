@@ -1,72 +1,25 @@
 #!/usr/bin/env bash
 #
-# server-setup.sh — Automated Server Provisioning: deploy-service + api-service
-# Installs and configures: Nomad, Docker (+BuildKit), Railpack, Redis, Traefik
-# (with Cloudflare DNS-01 TLS), deploy-service, and api-service (both
-# managed by pm2). Applies any pending Prisma migrations (for whichever
-# service has a schema) before starting either service under pm2.
+# server-setup.sh — provision a server: Nomad, Docker (+BuildKit), Railpack,
+# Redis, Traefik (Cloudflare DNS-01 TLS), and deploy-service + api-service
+# under pm2, applying pending Prisma migrations first. Target: a fresh
+# Ubuntu 24.04 server. Re-running is safe and expected.
 #
-# Target: a fresh Ubuntu 24.04 server.
+#   source prod.set-env.sh && source prod.variables.sh
+#   sudo -E bash server-setup.sh
 #
-# USAGE — always source set-env.sh first, then run this with sudo -E
-# (the -E preserves the environment variables the sourcing just set):
-#   source test.set-env.sh
-#   sudo -E bash test.server-setup.sh
+# Takes no flags: every value comes from the environment, which is what the
+# -E preserves. Required: APP_ENV DOMAIN CF_DNS_API_TOKEN ACME_EMAIL
+# DEPLOY_SERVICE_REPO API_SERVICE_REPO. Optional ones and their defaults are
+# in the doc below. DNS is manual — see README.md.
 #
-# This script takes NO command-line flags — every value it needs (APP_ENV,
-# DOMAIN, CF_DNS_API_TOKEN, ACME_EMAIL, etc.) comes from environment
-# variables that must already be set (normally by sourcing set-env.sh
-# immediately before running this).
+# >>> WHY any of this is the way it is — incidents, version pins, ordering
+# >>> constraints — is in server-setup.md. Read that before changing a step:
+# >>> most of what looks arbitrary here cost an outage to learn.
 #
-# ENVIRONMENT-AWARE NAMING (driven entirely by $APP_ENV, required, no exceptions):
-#   APP_ENV=prod:            bare names/domain, no prefix at all
-#                         -> deploy-service, api-service, ship.<DOMAIN>
-#   APP_ENV=test/demo/other: "<env>-" prefix on service names,
-#                         "<env>." inserted into the domain right before
-#                         the base domain, after any subdomain
-#                         -> test-deploy-service, test-api-service,
-#                            ship.test.<DOMAIN>
-#   Ports are also offset per environment (prod +0, test +1000,
-#   demo +2000) so multiple environments can coexist on one host
-#   without colliding, if that's ever needed.
-#
-# ARCHITECTURE:
-#   - deploy-service: public, does the actual build+deploy work. Auth on
-#     every request calls api-service's token-introspection endpoint.
-#     There is no bypass — every deploy request must present a real,
-#     valid token that api-service recognizes.
-#   - api-service: internal-only (never exposed via Traefik).
-#   - Both services' actual code is pulled from git (see
-#     DEPLOY_SERVICE_REPO / API_SERVICE_REPO below) — this script does
-#     NOT generate or assume anything about either service's internals
-#     beyond "has a package.json with a start script." Whatever each
-#     repo actually implements (token storage, company/project logic,
-#     etc.) is that repo's own concern — consult each one's own docs.
-#
-# DNS mapping is done MANUALLY, not by this script — see README.md for
-# the exact records to create. This script only configures the server
-# side (Nomad, Traefik, the two services); it never touches DNS.
-#
-# Required (environment variables — normally set by sourcing set-env.sh):
-#   APP_ENV                 test | demo | prod
-#   DOMAIN              e.g. embarko.ai
-#   CF_DNS_API_TOKEN    Cloudflare API token, "Edit zone DNS" scope, for
-#                       this zone — needed for Traefik's DNS-01 certificate
-#                       challenge, NOT for creating DNS records (that's
-#                       manual — see README.md)
-#   ACME_EMAIL          real email for Let's Encrypt expiry notices
-#   DEPLOY_SERVICE_REPO git URL for deploy-service's source
-#   API_SERVICE_REPO    git URL for api-service's source
-#
-# Optional:
-#   INTERNAL_API_SECRET  shared secret between deploy-service and api-service;
-#                        if not set, one is generated. Must be named exactly
-#                        this — it's written into each service's .env under
-#                        the key their own code actually reads
-#                        (process.env.INTERNAL_API_SECRET in both repos).
-#   DEPLOY_SUBDOMAIN     default: ship
-#   APPS_SUBDOMAIN_BASE  default: app   (apps live at <name>.<APPS_SUBDOMAIN_BASE>.[<env>.]<DOMAIN>)
-#   APP_USER             default: ubuntu (the user both services and pm2 run as — shared across environments, not env-prefixed)
+#   Usage, all variables ....... server-setup.md#overview
+#   Env-aware naming ........... server-setup.md#naming
+#   Architecture ............... server-setup.md#architecture
 
 set -euo pipefail
 
@@ -97,15 +50,9 @@ if [[ "$APP_ENV" == "prod" ]]; then
   PORT_OFFSET=0
 else
   PREFIX="${APP_ENV}-"
-  # Overridable: export DOMAIN_ENV_SEGMENT="" before sourcing this (e.g. in
-  # your set-env.sh) to serve this environment off the BARE domain
-  # (ship.<DOMAIN> instead of ship.test.<DOMAIN>) — useful when a domain
-  # already has DNS/a cert provisioned for it from before this environment
-  # naming scheme existed. Directory names, pm2 process names, and the
-  # port offset below are untouched either way — this only affects the
-  # domain. Uses bash's "-" (not ":-") so an explicitly-empty override is
-  # honored — only a genuinely UNSET DOMAIN_ENV_SEGMENT falls back to the
-  # default "<env>." segment.
+  # Export DOMAIN_ENV_SEGMENT="" to serve a non-prod env off the bare
+  # domain. "-" not ":-" so an explicitly-empty override is honoured.
+  # server-setup.md#naming
   DOMAIN_ENV_SEGMENT="${DOMAIN_ENV_SEGMENT-${APP_ENV}.}"
   case "$APP_ENV" in
     test) PORT_OFFSET=1000 ;;
@@ -123,20 +70,9 @@ API_PORT=$((4100 + PORT_OFFSET))
 # Traefik, never directly.
 ACTIVATOR_PORT=$((4200 + PORT_OFFSET))
 
-# How long an app must go without a real (non-bot) request before the idle
-# watcher may stop it. Defaulted here rather than required in
-# <env>.variables.sh so an older variables file still provisions.
-#
-# 360 minutes = 6 hours. The number is chosen around the cost of STOPPING,
-# not the cost of waking: waking is graceful (~5s, the visitor gets a slow
-# page and then correct content), but for the few seconds after a stop
-# Traefik still routes to the dead allocation and a request gets a hard
-# 502. So what matters is how OFTEN an app stops, not how long it stays
-# stopped. Working-day gaps run 4-6 hours, so a shorter threshold makes
-# apps cycle during office hours, putting those 502 windows exactly where
-# people are; 6 hours pushes almost every stop into the night, when the
-# same window is very unlikely to be hit by anyone. See
-# docs/scale-to-zero-gated-plan.md Step 5.
+# Minutes without a real (non-bot) request before the idle watcher may stop
+# an app. 6h is a conservative starting point for Step 6, not a tuned value,
+# and should be revisited with real data. server-setup.md#idle-threshold
 IDLE_THRESHOLD_MIN="${IDLE_THRESHOLD_MIN:-360}"
 
 # pm2 process names ALWAYS carry the APP_ENV prefix, even for prod —
@@ -176,12 +112,8 @@ echo "Detected server IP: ${SERVER_IP}"
 # ---------------------------------------------------------------------------
 # 1. Base packages
 # ---------------------------------------------------------------------------
-# apt/dpkg's lock can be held transiently by Ubuntu's own automatic
-# background updater (unattended-upgrades), on its own independent
-# schedule unrelated to anything this script does. Confirmed in practice
-# — this exact contention has actually happened, not theoretical. Wait it
-# out with a bounded retry rather than hard-failing, since this can occur
-# at genuinely unpredictable times on any fresh box.
+# Bounded retry: unattended-upgrades holds the dpkg lock on its own
+# schedule. Has actually happened here. server-setup.md#apt-lock
 wait_for_apt_lock() {
   local max_wait=300
   local waited=0
@@ -204,13 +136,9 @@ wait_for_apt_lock
 apt-get install -y wget gpg coreutils curl unzip jq ufw git xz-utils
 
 # ---------------------------------------------------------------------------
-# 2. Nomad — installed as a direct binary download from HashiCorp's releases,
-#    NOT via apt. This is deliberate: apt.releases.hashicorp.com does not
-#    reliably publish packages for every Ubuntu codename (confirmed missing
-#    for 20.04/focal in practice), which silently falls back to whatever
-#    ancient version Ubuntu's own `universe` repo happens to bundle —
-#    incompatible with the modern nomad.hcl this script generates. A direct
-#    binary download has no such dependency on OS version/codename at all.
+# 2. Nomad — direct binary download, NOT apt. HashiCorp's apt repo lacks
+#    packages for some Ubuntu codenames and silently falls back to an
+#    ancient universe build. server-setup.md#direct-binaries
 # ---------------------------------------------------------------------------
 echo "--> Installing Nomad (direct binary, not apt — see comment above for why)"
 NOMAD_VERSION=$(curl -s https://checkpoint-api.hashicorp.com/v1/check/nomad | jq -r .current_version)
@@ -279,25 +207,10 @@ plugin "docker" {
       enabled = true
     }
 
-    # Nomad's docker driver garbage collects images by default
-    # (gc.image = true, image_delay = "3m"): once the last allocation
-    # referencing an image is collected, it deletes the image itself.
-    #
-    # That is fatal to scale-to-zero. App images are built locally by
-    # railpack and pushed to NO registry, and job specs reference them
-    # with force_pull = false — so an image Nomad deletes is gone for
-    # good. Stopping an idle app therefore destroyed the only copy of its
-    # image three minutes later, and waking it failed with "pull access
-    # denied ... repository does not exist", which reads like a registry
-    # auth problem and is nothing of the sort. Diagnosed exactly that way
-    # on 2026-09-18 against scale-to-zero-test-1.
-    #
-    # Turned off rather than given a longer image_delay: deploy-service
-    # already owns image lifecycle end to end — pruneOldImages() keeps
-    # IMAGE_RETAIN_COUNT versions per app after each deploy, and teardown
-    # removes an app's images when it is deleted. Nomad's GC was a second,
-    # uncoordinated policy on top of that, which is also why rollback to
-    # an older imageTag could find its image missing.
+    # gc.image=false. Nomad's default (true, 3m) deletes an app's image
+    # once its allocations are collected — fatal for scale-to-zero, since
+    # images are local-only and force_pull=false. deploy-service owns image
+    # lifecycle instead. server-setup.md#nomad-image-gc
     gc {
       image = false
     }
@@ -308,22 +221,11 @@ EOF
 systemctl enable nomad
 systemctl restart nomad
 
-# Memory oversubscription — a CLUSTER-WIDE scheduler setting, not part of
-# nomad.hcl above and not something a job spec can turn on for itself.
-#
-# deploy-service's generated job specs declare both `memory` (the low
-# number Nomad bin-packs against) and `memory_max` (the ceiling a task may
-# burst to when the host has room) — see hostnsoft-deploy/nomad-job-spec.js
-# and docs/Memory-oversubscription-req.md. With this setting OFF, Nomad
-# still ACCEPTS those jobs but ignores memory_max entirely, which means
-# every app silently gets its low floor (32/128MB) as a HARD cap and starts
-# OOM-killing. It fails quiet, not loud — which is exactly why it belongs
-# in this script rather than staying a one-off manual command someone ran
-# on the live box once.
-#
-# `set-config` only overrides the flags actually passed, leaving the rest
-# of the scheduler config alone, so this is safe to re-run on an existing
-# server (this whole script is meant to be idempotent).
+# Memory oversubscription: a CLUSTER-WIDE scheduler setting, not in
+# nomad.hcl and not settable by a job spec. With it off Nomad accepts job
+# specs but IGNORES memory_max, so every app gets its low floor as a hard
+# cap and OOM-kills — silently. Safe to re-run.
+# server-setup.md#oversubscription
 echo "--> Enabling Nomad memory oversubscription"
 # Needs an elected leader, which isn't instant after the restart above.
 nomad_ready=false
@@ -384,20 +286,9 @@ fi
 usermod -aG docker "${APP_USER}" || true
 
 # ---------------------------------------------------------------------------
-# 3b. Redis — local instance for api-service (REDIS_URL in variables.sh).
-#     Bound to 127.0.0.1 only: never exposed publicly, no ufw rule needed.
-#     Idempotent — apt is a no-op if already installed; config is rewritten
-#     in place and the service restarted on every run.
-#
-#     NOT pinned to a specific version — installed via apt, so the actual
-#     Redis version depends entirely on this Ubuntu release's package
-#     archive (e.g. 22.04 ships 6.0.x, 24.04 ships 7.0.x). Confirmed in
-#     practice: api-service's connectorPendingLogin.ts originally used
-#     GETDEL (added in Redis 6.2) and failed in prod with "ERR unknown
-#     command `GETDEL`" against an older apt-installed Redis — fixed in
-#     that repo by using MULTI GET+DEL instead, which works on any
-#     version. Keep app code Redis-version-agnostic rather than assuming
-#     whatever this apt package happens to install here.
+# 3b. Redis — local, 127.0.0.1 only (so no ufw rule), installed via apt so
+#     the VERSION depends on the Ubuntu release. Keep app code
+#     version-agnostic; GETDEL once broke prod. server-setup.md#redis
 # ---------------------------------------------------------------------------
 echo "--> Installing Redis"
 if ! command -v redis-server >/dev/null 2>&1; then
@@ -424,43 +315,16 @@ fi
 # ---------------------------------------------------------------------------
 # 4. BuildKit + Railpack
 #
-# Pinned to v0.30.0, NOT :latest — deliberate. BuildKit v0.31.0+ (through
-# at least v0.32.2) bundles a runc with a masked-paths hardening regression
-# (CVE-2025-31133 / 52881 / 52565): runc's maskDir() now mounts masked
-# paths like /proc/acpi with a tmpfs option (nr_inodes=1) that several
-# kernels — confirmed on Ubuntu 20.04's 5.4 kernel, also seen on various
-# cloud/KVM guest kernels — reject with EINVAL, so EVERY build-step
-# container fails at init with "can't mask dir ... invalid argument".
-# v0.30.0 is the last release before this regression (runc 1.3.5,
-# unaffected). Confirmed in practice, not theoretical — this exact
-# failure has been hit. Bump this pin once BuildKit ships runc >= 1.4.4
-# (the fixed version) — check https://github.com/moby/moby/issues/52972
-# before assuming a newer tag is safe again.
+# Pinned to v0.30.0, NOT :latest — v0.31.0+ bundles a runc whose masked-path
+# handling fails on this kernel, breaking every build. Check the linked
+# issue before bumping. server-setup.md#buildkit
 # ---------------------------------------------------------------------------
 echo "--> Starting BuildKit"
 docker rm -f buildkit >/dev/null 2>&1 || true
-# --restart unless-stopped: caught during a 2026-09-12 reboot-resilience
-# review, before ever actually rebooting production — a bare `docker run
-# -d` with no restart policy does NOT come back after a host reboot,
-# unlike the Nomad-managed jobs and systemd-enabled services elsewhere in
-# this script, which do. Without this, new builds/deploys would silently
-# fail after any reboot until someone noticed and restarted this container
-# by hand. "unless-stopped" (not "always") so an operator's own deliberate
-# `docker stop buildkit` is still respected rather than immediately undone.
-#
-# -v buildkit-cache:/var/lib/buildkit: BuildKit's entire layer cache lives
-# in that path INSIDE the container, so the `docker rm -f` above used to
-# destroy it on every run of this script — making the next build of every
-# app a cold, from-scratch one. Measured on 2026-09-18: app build times
-# roughly doubled (to 4-5 minutes) immediately after a re-provision, with
-# nothing else changed. A NAMED volume survives container removal, so the
-# container stays disposable (which is what makes this script re-runnable)
-# while the cache does not.
-#
-# Not a bind mount: the cache is BuildKit's private format, nothing else
-# reads it, and a named volume needs no host path to exist or be chowned.
-# BuildKit runs its own periodic GC inside the volume, so this grows to a
-# bounded size rather than forever.
+# --restart unless-stopped: a bare `docker run -d` does not survive a host
+# reboot, unlike everything else here. -v buildkit-cache: the layer cache
+# lives inside the container, so the `docker rm -f` above used to wipe it
+# on every run and double build times. server-setup.md#buildkit
 docker run --privileged -d --restart unless-stopped --name buildkit \
   -v buildkit-cache:/var/lib/buildkit \
   moby/buildkit:v0.30.0
@@ -485,21 +349,9 @@ fi
 
 echo "--> Installing Railpack (direct binary, not their install.sh)"
 if ! command -v railpack >/dev/null 2>&1; then
-  # railpack.com/install.sh is not usable on this OS for two separate
-  # reasons, both confirmed in practice, not theoretical:
-  #   1. It uses `curl --retry-all-errors` unconditionally in its actual
-  #      download step (not just version detection) — a flag curl only
-  #      gained in 7.71; Ubuntu 20.04 ships 7.68. Pre-supplying
-  #      RAILPACK_VERSION only skips ONE use of this flag (their
-  #      version-detection step) — the download step fails the same way
-  #      regardless.
-  #   2. The script uses bash-only `[[ ]]` syntax while `curl | sh`
-  #      invokes `dash` on Ubuntu, which doesn't support it — separate
-  #      failures ("sh: [[: not found") on top of the curl issue.
-  # Bypassing their installer entirely and downloading the release
-  # asset directly avoids both problems and has no OS-version
-  # dependency at all — same approach as Nomad above, for the same
-  # reason.
+  # Their install.sh is unusable here: it needs curl >= 7.71 and uses
+  # bash-only syntax under dash. Download the asset directly, same as Nomad
+  # above. server-setup.md#direct-binaries
   RAILPACK_VERSION=$(curl -sS https://api.github.com/repos/railwayapp/railpack/releases/latest | jq -r '.tag_name' | sed 's/^v//')
   if [[ -z "$RAILPACK_VERSION" || "$RAILPACK_VERSION" == "null" ]]; then
     echo "    Could not determine latest Railpack version via GitHub API — falling back to a pinned known-good version."
@@ -520,35 +372,19 @@ if ! grep -q BUILDKIT_HOST /etc/environment 2>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Traefik — config files + Nomad job
-#    Two routers on ONE domain: bare path -> deploy-service, /api -> api-service.
-#    Router/service names use the env-prefixed service names, so config
-#    for multiple environments can coexist in the same dynamic.yml
-#    without name collisions if ever merged onto one Traefik instance.
-#    There is only ONE Traefik job regardless of environment — it's the
-#    shared reverse proxy for this host, not per-environment itself.
+# 5. Traefik — config files + Nomad job. Two routers on one domain: bare
+#    path -> deploy-service, /api -> api-service. ONE Traefik job for the
+#    host regardless of environment. server-setup.md#traefik
 # ---------------------------------------------------------------------------
 echo "--> Configuring Traefik"
 mkdir -p /opt/traefik
 touch /opt/traefik/acme.json
 chmod 600 /opt/traefik/acme.json
 
-# JSON access log, mounted out to the host — read by every environment's
-# hostnsoft-deploy (see its analytics/access-log-tailer.js) to build
-# per-app traffic/error/latency analytics. There is only ONE Traefik
-# instance regardless of environment (see the note above), so this one
-# log is shared read-only input for every environment's own analytics
-# ingestion, each tracking its own read position independently.
-#
-# world-readable+executable directory: Traefik's container writes this
-# file as root, but deploy-service reads it as the non-root APP_USER.
-# The file itself isn't chmod'd here (it doesn't exist until Traefik's
-# first log write) — this relies on Traefik creating it with the
-# ordinary 644 a root process gets under a standard umask, which is the
-# common case but hasn't been independently confirmed against this
-# exact Traefik image; if deploy-service logs permission-denied reading
-# this path, chmod the file itself (or adjust Traefik's container
-# umask) rather than loosening this directory further.
+# JSON access log written to a file and mounted out: every environment's
+# deploy-service tails it off disk for per-app analytics. The directory is
+# world-readable because Traefik writes as root while deploy-service reads
+# as APP_USER. server-setup.md#access-log
 mkdir -p /opt/traefik/logs
 chmod 755 /opt/traefik/logs
 
@@ -559,27 +395,46 @@ chmod 755 /opt/traefik/logs
 touch /opt/traefik/acme-http.json
 chmod 600 /opt/traefik/acme-http.json
 
-# Router priorities, and why they're this large.
+# Platform router priorities sit far above any value Traefik derives from
+# rule length (~25-40 for an app router), so no customer app can capture a
+# platform hostname. The 10000/10100 gap keeps /api ahead of the bare host.
+# server-setup.md#router-priorities
+# --- scale-to-zero wake-on-request routers (plan Steps 4 and 6) ------------
 #
-# Traefik gives a router with no explicit priority a priority equal to its
-# rule's LENGTH. Every customer app's router (hostnsoft-deploy's
-# nomad-job-spec.js) is generated without one, so each sits somewhere
-# around 25-40. The two platform routers below used to be 100 and 1 —
-# numbers chosen only to order them against each OTHER, which left the
-# deploy service at priority 1: below every app router on the host.
+# A STOPPED app has no Traefik router at all, so its hostname would 404.
+# These hand those hostnames to deploy-service/activator.js, which starts
+# the job and forwards the request. priority 500 keeps the activator
+# PERMANENTLY in front, which is what closes the post-stop 502 window.
 #
-# That only stayed safe because an app's hostname is always
-# <slug>.app.<domain> and can never equal ${DEPLOY_HOST}. The moment apps
-# are served at <slug>.<domain>, an app named after the deploy host would
-# emit Host(`${DEPLOY_HOST}`) at ~25 and outrank the real deploy service —
-# taking over the endpoint agents POST source and deploy tokens to.
-# Traefik matches on the Host header, so DNS doesn't protect this.
+# THIS LIST MUST MATCH deploy-service/scale-to-zero-apps.js — kept in step by
+# hand, since dynamic.yml is generated before the repo is pulled.
 #
-# These are set far above any rule-length-derived value so the platform's
-# own hostnames cannot be captured by a router from the Nomad provider,
-# whatever it's called. This is the floor; the reserved-name list is the
-# other, independent guard. The gap between the two preserves the original
-# intent: /api must still beat the bare host.
+# An app here must serve ONLY <app>.${APPS_DOMAIN_SUFFIX}; a custom domain
+# would still 404 while stopped. Check first:
+#   nomad job inspect <app> | grep -o 'Host(`[^`]*`)' | sort -u
+#
+# server-setup.md#s2z-routers
+SCALE_TO_ZERO_APPS=(
+  scale-to-zero-test-1
+  demo-python
+  pushpendra-agrawal
+  socket-ux
+)
+
+S2Z_ROUTERS=""
+for s2z_app in "${SCALE_TO_ZERO_APPS[@]}"; do
+  S2Z_ROUTERS+="
+    ${PREFIX}wake-${s2z_app}:
+      rule: \"Host(\`${s2z_app}.${APPS_DOMAIN_SUFFIX}\`)\"
+      entryPoints:
+        - websecure
+      service: ${PREFIX}scale-to-zero-activator
+      priority: 500
+      tls:
+        certResolver: cloudflare
+"
+done
+
 cat > /opt/traefik/dynamic.yml << EOF
 http:
   routers:
@@ -603,36 +458,7 @@ http:
       tls:
         certResolver: cloudflare
 
-    # --- scale-to-zero wake-on-request (plan Step 4) ---------------------
-    #
-    # A STOPPED app has no Traefik router at all: app routers come from
-    # the Nomad provider, which only sees RUNNING services. Its hostname
-    # would simply 404. This fallback router catches that hostname and
-    # hands it to deploy-service/activator.js, which starts the job, waits
-    # for it, and forwards the original request.
-    #
-    # priority: 1 is the whole mechanism. App routers set no explicit
-    # priority, so Traefik derives theirs from the rule's length (~44 for
-    # a Host rule) — any running app therefore outranks this by a wide
-    # margin and its traffic never touches the activator. The instant the
-    # job stops and its router disappears, this becomes the only match.
-    #
-    # ONE router per app, by exact hostname, never a wildcard: that is
-    # what makes "no other app's traffic can reach the activator" a fact
-    # about this file rather than a hope about its code. The app names
-    # here MUST match WAKEABLE_APPS in activator.js — an app routed here
-    # but not in that list gets a 404 instead of a wake, and an app in
-    # that list with no router here is never woken because nothing ever
-    # reaches the activator. Step 6/7 is where this stops being hand-
-    # maintained.
-    ${PREFIX}wake-scale-to-zero-test-1:
-      rule: "Host(\`scale-to-zero-test-1.${APPS_DOMAIN_SUFFIX}\`)"
-      entryPoints:
-        - websecure
-      service: ${PREFIX}scale-to-zero-activator
-      priority: 1
-      tls:
-        certResolver: cloudflare
+${S2Z_ROUTERS}
 
   middlewares:
     ${PREFIX}strip-api-prefix:
@@ -706,34 +532,19 @@ job "traefik" {
           "--providers.nomad=true",
           "--providers.nomad.endpoint.address=http://127.0.0.1:4646",
           "--providers.nomad.exposedByDefault=false",
-          # Default is 15s. That interval is a BLACKOUT WINDOW for
-          # scale-to-zero: between an app being stopped and Traefik
-          # noticing, Traefik still holds that app's own router pointing
-          # at a dead allocation, so requests get a fast 502 instead of
-          # falling through to the priority-1 activator router that would
-          # have woken it. Measured on 2026-09-18 — 10 requests sent
-          # seconds after a stop all failed without the activator ever
-          # being invoked.
-          #
-          # 5s shortens the window rather than closing it; nothing here
-          # can make Traefik's view of a stopped job instantaneous. The
-          # poll is against Nomad's local API and is cheap.
+          # Default 15s. Shortens (does not close) the window after a
+          # stop in which Traefik still routes to a dead allocation; the
+          # always-front router above is what closes it.
+          # server-setup.md#refresh-interval
           "--providers.nomad.refreshInterval=5s",
           "--providers.file.filename=/etc/traefik/dynamic.yml",
           "--certificatesresolvers.cloudflare.acme.dnschallenge=true",
           "--certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare",
           "--certificatesresolvers.cloudflare.acme.email=${ACME_EMAIL}",
           "--certificatesresolvers.cloudflare.acme.storage=/acme.json",
-          # HTTP-01 resolver for CLIENT custom domains (see api-service's
-          # docs/Customdomain-req.md constraint #1) — DNS-01 above only
-          # works for domains in this platform's own Cloudflare zone;
-          # HTTP-01 works for any domain pointed at this server regardless
-          # of who controls its DNS. Traefik natively excludes its own
-          # ACME challenge path from the web->websecure redirect above, so
-          # the two coexist on the same :80 entrypoint without conflict —
-          # confirmed against a real externally-pointed test domain before
-          # relying on this in prod; don't just take this comment's word
-          # for it.
+          # HTTP-01 for CLIENT custom domains — the DNS-01 resolver above
+          # only covers this platform's own zone. Coexists with the
+          # web->websecure redirect. server-setup.md#http01
           "--certificatesresolvers.letsencrypt-http.acme.httpchallenge=true",
           "--certificatesresolvers.letsencrypt-http.acme.httpchallenge.entrypoint=web",
           "--certificatesresolvers.letsencrypt-http.acme.email=${ACME_EMAIL}",
@@ -750,19 +561,10 @@ job "traefik" {
 EOF
 
 # ---------------------------------------------------------------------------
-# 6. deploy-service and api-service — clean pull from git, branch = APP_ENV
-#
-# "Clean pull" means: if the code directory already exists (a prior
-# deploy), discard ANY local drift and reset it to exactly match the
-# remote branch — never merge, never leave stale files around. If it
-# doesn't exist yet, clone fresh. Either way, the directory ends up
-# byte-for-byte what's on the remote branch named "${APP_ENV}".
-#
-# This script does NOT know or assume anything about what's inside
-# either repo beyond: it has a package.json with a "start" script.
-# Application-level concerns (database setup, initial token/company
-# creation, etc.) are the repo's own responsibility now — consult each
-# repo's own README for that, not this script.
+# 6. deploy-service and api-service — clean pull from git, branch = APP_ENV.
+#    Discards ANY local drift: reset --hard + clean -fd, never merge. This
+#    is why app data and analytics live outside these checkouts.
+#    server-setup.md#clean-pull
 # ---------------------------------------------------------------------------
 
 clean_pull() {
@@ -817,15 +619,10 @@ if [[ -d "${APP_HOME}/${DEPLOY_SERVICE_NAME}/orphan-proxy" ]]; then
 fi
 
 echo "--> Generating .env files from each repo's .env.example"
-# Exported here (not just passed to pm2 later) so hydrate_env_file's
-# indirect lookup (${!key}) picks them up and bakes them into each
-# service's actual .env — both services load their .env via dotenv, so
-# this is what they see at runtime, not whatever's on pm2's command line.
-#
-# PORT is exported separately per service, right before that service's
-# own hydrate_env_file call — deploy-service and api-service each need a
-# DIFFERENT port (DEPLOY_PORT vs API_PORT), so a single shared export
-# would leak the wrong value into whichever one hydrates second.
+# Exported (not just passed to pm2) so hydrate_env_file's ${!key} lookup
+# bakes them into each service's .env, which is what dotenv actually reads.
+# PORT is exported per service, separately, immediately before that
+# service's own hydrate call. server-setup.md#env-exports
 export HOSTNSOFT_API_URL="http://127.0.0.1:${API_PORT}"
 export APPS_DOMAIN_SUFFIX  # value already computed in section 0 above
 
@@ -839,15 +636,10 @@ export APPS_DOMAIN_SUFFIX  # value already computed in section 0 above
 export EDGE_HOSTNAME
 export ORIGIN_SERVER_IP="${SERVER_IP}"
 
-# The platform's own zone — api-service refuses to register any custom
-# domain that is, or sits under, it. Such a name resolves to this origin,
-# so it would pass DNS verification on the IP-match fallback and then take
-# a Traefik router for a platform hostname.
-#
-# $DOMAIN is the bare registrable domain, which is exactly the right value,
-# and this deliberately keeps any explicit setting from variables.sh: it is
-# a security control, so an operator stating it outright should win over
-# anything computed here.
+# The platform's own zone: api-service refuses to register any custom
+# domain under it, which would otherwise pass DNS verification and take a
+# router for a platform hostname. An explicit setting wins — it is a
+# security control. server-setup.md#platform-domain
 export PLATFORM_DOMAIN="${PLATFORM_DOMAIN:-$DOMAIN}"
 
 # Anonymous deploys' orphan-proxy sidecar (deploy-service's
@@ -871,28 +663,10 @@ mkdir -p "${ANALYTICS_DIR}"
 chown "${APP_USER}:${APP_USER}" "${ANALYTICS_DIR}"
 export ANALYTICS_DB_PATH="${ANALYTICS_DIR}/analytics.db"
 
-# Per-app persistent storage (deploy-service's nomad-job-spec.js) — each
-# app's DATA_DIR is a subdirectory here, bind-mounted into its container
-# at /data.
-#
-# This exists so an app's data is NOT owned by its Nomad allocation.
-# DATA_DIR used to be /alloc/data, which Nomad garbage-collects along
-# with a stopped job (job_gc_threshold, 4h by default) — fine while every
-# app ran forever, fatal the moment anything stops one. A SQLite database
-# would come back empty, and silently, since an app that finds no
-# database usually just creates a fresh one and looks healthy. This is
-# the prerequisite for scale-to-zero.
-#
-# Per-environment, like ANALYTICS_DIR above, so prod/test/demo can never
-# collide on an app name. Created here rather than left to the app so it
-# exists with the right owner before deploy-service ever starts. NOT
-# under any git-managed checkout: clean_pull does `git reset --hard &&
-# git clean -fd` on every re-run, which would erase every app's database.
-#
-# deploy-service chmods each app's own subdirectory to 0777 as it creates
-# it — Railpack images do not all run as root, and a container that
-# cannot write its own data directory fails at runtime rather than at
-# deploy time.
+# Per-app persistent storage, bind-mounted to /data. Exists so app data is
+# NOT owned by its Nomad allocation — /alloc/data is garbage collected with
+# a stopped job, which would silently empty every SQLite database. This is
+# the prerequisite for scale-to-zero. server-setup.md#app-data-root
 export APP_DATA_ROOT="/opt/embarko-appdata/${APP_ENV}"
 mkdir -p "${APP_DATA_ROOT}"
 chown "${APP_USER}:${APP_USER}" "${APP_DATA_ROOT}"
@@ -903,17 +677,10 @@ hydrate_env_file "${APP_HOME}/${DEPLOY_SERVICE_NAME}"
 export PORT="${API_PORT}"
 hydrate_env_file "${APP_HOME}/${API_SERVICE_NAME}"
 
-# PORT was exported per service immediately before each hydrate above, so
-# the LAST value (api-service's) is still in scope here. That matters: the
-# pm2 ecosystem file deliberately does not set PORT, leaving each service
-# to read its own .env — but dotenv does NOT override a variable already
-# present in the environment, and `pm2 start` below inherits this shell.
-# Left set, deploy-service would come up on api-service's port: Traefik
-# then finds nothing on 4000 (502 on the deploy host), routes /api to the
-# wrong process, and api-service crash-loops unable to bind. That is
-# exactly the outage of 2026-09-17, reproduced by provisioning alone.
-#
-# Unset, so each service's own .env is authoritative.
+# Unset PORT before pm2 starts. dotenv does NOT override an already-set
+# variable and `pm2 start` inherits this shell, so a leftover PORT puts
+# deploy-service on api-service's port. That was the 2026-09-17 outage,
+# reproducible by provisioning alone. server-setup.md#unset-port
 unset PORT
 
 chown -R "${APP_USER}:${APP_USER}" "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_NAME}" "${APP_HOME}/traefik.nomad"
@@ -948,19 +715,14 @@ if ! command -v pm2 >/dev/null 2>&1; then
   HOME=/root npm install -g pm2
 fi
 
-# npm ci (not npm install): guarantees a fully clean node_modules on
-# every run (it removes any existing one internally) while installing
-# the EXACT versions pinned in package-lock.json — unlike `rm -rf
-# node_modules package-lock.json && npm install`, which would discard
-# those pinned versions and let npm resolve potentially newer,
-# untested ones instead. Falls back to `npm install` only if a repo
-# genuinely has no committed lockfile (npm ci requires one).
+# npm ci for pinned versions, --include=dev so NODE_ENV=production cannot
+# strip typescript and break the build. server-setup.md#npm-install
 for svc_dir in "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_NAME}"; do
   if sudo -u "${APP_USER}" bash -c "test -f '${svc_dir}/package-lock.json'"; then
-    sudo -u "${APP_USER}" bash -c "cd '${svc_dir}' && npm ci"
+    sudo -u "${APP_USER}" bash -c "cd '${svc_dir}' && npm ci --include=dev"
   else
     echo "    ${svc_dir} has no package-lock.json — falling back to npm install"
-    sudo -u "${APP_USER}" bash -c "cd '${svc_dir}' && rm -rf node_modules && npm install"
+    sudo -u "${APP_USER}" bash -c "cd '${svc_dir}' && rm -rf node_modules && npm install --include=dev"
   fi
 done
 
@@ -977,19 +739,10 @@ for svc_dir in "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_N
   fi
 done
 
-# Apply pending Prisma migrations, for whichever service(s) actually use
-# Prisma — detected generically (a prisma/schema.prisma file), same "no
-# built-in knowledge of either repo's internals" philosophy as the build-
-# script check above, rather than hardcoding this to api-service by name.
-# `migrate deploy` (not `migrate dev`) is the correct command outside a
-# dev environment: it only applies already-committed migrations and never
-# prompts or generates new ones. Must run BEFORE pm2 starts anything
-# below — a service with a schema newer than its actual database (a
-# missing table/column from a migration that was never applied here)
-# will fail confusingly at the first request that touches it rather than
-# at a clear startup step. DATABASE_URL is already in this service's own
-# .env from hydrate_env_file above, which Prisma's CLI reads the same way
-# the app itself does.
+# Apply pending Prisma migrations, detected generically
+# (prisma/schema.prisma) rather than hardcoded to api-service.
+# `migrate deploy`, never `migrate dev`. MUST run before pm2 starts
+# anything. server-setup.md#prisma
 for svc_dir in "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_NAME}"; do
   HAS_PRISMA_SCHEMA=$(sudo -u "${APP_USER}" bash -c "test -f '${svc_dir}/prisma/schema.prisma'" && echo "yes" || echo "no")
   if [[ "$HAS_PRISMA_SCHEMA" == "yes" ]]; then
@@ -1000,17 +753,11 @@ done
 
 
 # ---------------------------------------------------------------------------
-# 7. Firewall — 22 (SSH), 80, and 443 are public. Neither service's own
-#    port is opened: both bind 127.0.0.1 only, reachable exclusively
-#    through Traefik on 443.
+# 7. Firewall — 22, 80, 443 public; neither service's port is opened (both
+#    bind 127.0.0.1, reachable only via Traefik).
 #
-#    SSH MUST be allowed before `ufw --force enable` runs, not after —
-#    confirmed the hard way: an earlier version of this script enabled
-#    ufw without ever explicitly allowing port 22, which immediately cut
-#    off all NEW inbound SSH connections (already-established sessions
-#    can survive, which is why the script itself kept running — but
-#    reconnecting afterward was impossible without out-of-band console
-#    access). Do not reorder these three lines.
+#    SSH MUST be allowed BEFORE `ufw --force enable`. Do not reorder these
+#    three lines — getting it wrong locks you out. server-setup.md#firewall
 # ---------------------------------------------------------------------------
 echo "--> Configuring firewall (OS-level, via ufw)"
 ufw allow 22/tcp
@@ -1034,21 +781,10 @@ echo "--> Deploying Traefik"
 sudo -u "${APP_USER}" bash -c "nomad job run ${APP_HOME}/traefik.nomad"
 
 # ---------------------------------------------------------------------------
-# 9. Start both services under pm2, persist across reboots
+# 9. Start both services under pm2, persist across reboots.
 #
-# A pm2 ecosystem file (not ad-hoc `pm2 start npm --name ...` CLI calls)
-# is written to ${APP_HOME}/ecosystem.config.js — a discoverable, re-runnable
-# definition of both processes. Per-environment secrets/URLs (INTERNAL_API_SECRET,
-# PORT, HOSTNSOFT_API_URL) are NOT duplicated here — they're already baked
-# into each service's own .env by hydrate_env_file above, which each
-# service loads itself via dotenv. Only BUILDKIT_HOST goes in `env` below,
-# since it isn't an app secret, just something deploy-service's child
-# `railpack`/buildkit invocations expect to inherit.
-#
-# Once this has run once, ${PM2_DEPLOY_NAME}/${PM2_API_NAME} are registered
-# with pm2 by name — `pm2 restart <name>` or `pm2 start <name>` (after a
-# stop) work with no arguments from then on; re-running this whole
-# ecosystem file also works (`pm2 start ecosystem.config.js`).
+#    An ecosystem file, not ad-hoc CLI calls. Secrets are NOT duplicated
+#    here — they are already in each service's .env. server-setup.md#pm2
 # ---------------------------------------------------------------------------
 echo "--> Writing pm2 ecosystem file and starting ${PM2_DEPLOY_NAME} + ${PM2_API_NAME}"
 echo "    (using 'npm start' — each repo's package.json must define a"
@@ -1102,28 +838,13 @@ sudo -u "${APP_USER}" bash -c "
 env PATH=$PATH:/usr/bin pm2 startup systemd -u "${APP_USER}" --hp "${APP_HOME}" || true
 
 # ---------------------------------------------------------------------------
-# 9b. Scale-to-zero idle watcher — a systemd timer, not cron.
+# 9b. Scale-to-zero idle watcher — a systemd timer, not cron (journal +
+#     Persistent). Runs as APP_USER, NEVER root: idle-report.js opens the
+#     analytics database read-write, and root would leave root-owned
+#     -wal/-shm files the service then cannot write past.
 #
-# Step 5 of docs/scale-to-zero-gated-plan.md: idle detection has to run on
-# a schedule rather than by hand. A timer rather than cron for two reasons
-# that matter here — the run's output lands in the journal where it can
-# actually be read afterwards, and Persistent=true means a run missed
-# while the box was down happens at boot instead of being silently
-# skipped.
-#
-# Runs as APP_USER, never root. idle-report.js opens the analytics
-# database read-write (it sets WAL mode), so a root run would leave
-# root-owned -wal/-shm files beside a ubuntu-owned database and break the
-# running service's ability to write to it.
-#
-# SAFETY: this timer can only ever stop an app named in STOPPABLE_APPS, a
-# frozen list hardcoded in idle-report.js. Putting it on a schedule does
-# NOT widen what it may touch — every other idle app is reported and left
-# running, which is exactly what makes scheduling it safe at this stage.
-#
-# IDLE_THRESHOLD_MIN comes from <env>.variables.sh. That value is the
-# PRODUCTION threshold; the Step 5 soak overrides it with something much
-# shorter, via scale-to-zero-soak.sh, to force many cycles per day.
+#     SAFETY: it can only stop an app named in scale-to-zero-apps.js.
+#     Scheduling it does not widen that. server-setup.md#idle-watcher
 # ---------------------------------------------------------------------------
 IDLE_WATCHER_UNIT="embarko-idle-${APP_ENV}"
 echo "--> Installing scale-to-zero idle watcher timer '${IDLE_WATCHER_UNIT}' (threshold: ${IDLE_THRESHOLD_MIN} min)"
@@ -1166,6 +887,49 @@ EOF
 write_idle_watcher_units
 systemctl daemon-reload
 systemctl enable --now "${IDLE_WATCHER_UNIT}.timer"
+
+# ---------------------------------------------------------------------------
+# 9c. Docker GC — a daily timer.
+#
+#     Every container creation orphans an anonymous volume for images that
+#     declare VOLUME, and nothing reuses them. Reached 74.66GB / 91% disk on
+#     2026-09-21 with no symptom but `df`. Scale-to-zero makes it worse: one
+#     orphan per sleep/wake cycle.
+#
+#     SAFE: app data is a BIND MOUNT and never appears in `docker volume ls`;
+#     the images pruned are dangling-only. Tagged images are untouched here —
+#     that is prune-app-images.sh. server-setup.md#docker-gc
+# ---------------------------------------------------------------------------
+DOCKER_GC_UNIT="embarko-docker-gc-${APP_ENV}"
+echo "--> Installing Docker GC timer '${DOCKER_GC_UNIT}' (daily)"
+
+cat > "/etc/systemd/system/${DOCKER_GC_UNIT}.service" << EOF
+[Unit]
+Description=Embarko Docker GC — reclaim orphaned anonymous volumes and dangling images (${APP_ENV})
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker volume prune -f
+ExecStart=/usr/bin/docker image prune -f
+EOF
+
+cat > "/etc/systemd/system/${DOCKER_GC_UNIT}.timer" << EOF
+[Unit]
+Description=Run Embarko Docker GC daily (${APP_ENV})
+
+[Timer]
+# OnActiveSec, not OnBootSec — see the idle watcher timer above for why an
+# OnBootSec deadline on a long-running box never fires.
+OnActiveSec=15min
+OnUnitInactiveSec=24h
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now "${DOCKER_GC_UNIT}.timer"
 
 # ---------------------------------------------------------------------------
 # 10. DNS — done manually, not by this script. See README.md for the

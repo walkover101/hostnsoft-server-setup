@@ -42,6 +42,27 @@ branch **named exactly `$APP_ENV`** (`test`, `demo`, or `prod`) — not
 branch, then re-run `sudo -E bash server-setup.sh` on that server (after
 re-sourcing the same `<env>.set-env.sh`/`<env>.variables.sh`).
 
+### Which script to run
+
+`server-setup.sh` is a SUPERSET of `redeploy.sh` for code. It clean-pulls
+both repos (`git reset --hard origin/$APP_ENV`, stronger than
+`redeploy.sh`'s `git pull`), runs `npm ci --include=dev`, builds, applies
+Prisma migrations, rebuilds the orphan-proxy image, and restarts all three
+pm2 processes. **Never run `redeploy.sh` before it — that is pure
+duplication.**
+
+Choose on what actually changed:
+
+| Changed | Run |
+|---|---|
+| Only deploy-service / api-service code | `bash redeploy.sh prod` |
+| Traefik config, `nomad.hcl`, systemd timers, ports, a new pm2 process | `sudo -E bash server-setup.sh` |
+
+The difference that matters is blast radius, not completeness:
+`server-setup.sh` restarts Nomad, Docker and Traefik, so **every customer
+app drops briefly**. `redeploy.sh` touches neither, which is why it is the
+right tool for a code-only change even though it does less.
+
 For routine code changes, don't re-run `server-setup.sh` — it restarts
 Nomad, Docker and Traefik and takes every customer app down. Use:
 
@@ -298,3 +319,14 @@ routed here but missing from that list gets a 404 instead of a wake; an
 app in that list with no router here is never woken, because nothing ever
 reaches the activator. Step 6/7 of the plan is where this stops being
 manual.
+
+## Where the reasoning lives
+
+`server-setup.sh` keeps short comments saying *what* each step does. The
+*why* — incidents, version pins, ordering constraints that cost real
+downtime — is in **`server-setup.md`**, linked from each step by anchor
+(`server-setup.md#nomad-image-gc`, `#buildkit`, `#firewall`, …).
+
+Read it before changing a step in the script. Most of what looks arbitrary
+there was learned from an outage, and the script no longer explains itself
+at length.

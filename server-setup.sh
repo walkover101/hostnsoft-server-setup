@@ -386,6 +386,12 @@ chmod 600 /opt/traefik/acme.json
 # world-readable because Traefik writes as root while deploy-service reads
 # as APP_USER. server-setup.md#access-log
 mkdir -p /opt/traefik/logs
+# Traefik watches this DIRECTORY, not a single file: server-setup.sh owns
+# platform.yml in it, deploy-service owns scale-to-zero.yml, and neither can
+# overwrite the other. Owned by APP_USER because deploy-service writes here
+# as that user. server-setup.md#s2z-routers
+mkdir -p /opt/traefik/dynamic
+chown "${APP_USER}:${APP_USER}" /opt/traefik/dynamic
 chmod 755 /opt/traefik/logs
 
 # Separate cert storage for the HTTP-01 resolver (client custom domains,
@@ -399,43 +405,12 @@ chmod 600 /opt/traefik/acme-http.json
 # rule length (~25-40 for an app router), so no customer app can capture a
 # platform hostname. The 10000/10100 gap keeps /api ahead of the bare host.
 # server-setup.md#router-priorities
-# --- scale-to-zero wake-on-request routers (plan Steps 4 and 6) ------------
-#
-# A STOPPED app has no Traefik router at all, so its hostname would 404.
-# These hand those hostnames to deploy-service/activator.js, which starts
-# the job and forwards the request. priority 500 keeps the activator
-# PERMANENTLY in front, which is what closes the post-stop 502 window.
-#
-# THIS LIST MUST MATCH deploy-service/scale-to-zero-apps.js — kept in step by
-# hand, since dynamic.yml is generated before the repo is pulled.
-#
-# An app here must serve ONLY <app>.${APPS_DOMAIN_SUFFIX}; a custom domain
-# would still 404 while stopped. Check first:
-#   nomad job inspect <app> | grep -o 'Host(`[^`]*`)' | sort -u
-#
-# server-setup.md#s2z-routers
-SCALE_TO_ZERO_APPS=(
-  scale-to-zero-test-1
-  demo-python
-  pushpendra-agrawal
-  socket-ux
-)
+# Scale-to-zero routers are NOT written here any more. deploy-service
+# generates them per HOSTNAME into scale-to-zero.yml in the same directory,
+# from its own registry, which is what lets an app opt in at deploy time
+# and what covers custom domains. server-setup.md#s2z-routers
 
-S2Z_ROUTERS=""
-for s2z_app in "${SCALE_TO_ZERO_APPS[@]}"; do
-  S2Z_ROUTERS+="
-    ${PREFIX}wake-${s2z_app}:
-      rule: \"Host(\`${s2z_app}.${APPS_DOMAIN_SUFFIX}\`)\"
-      entryPoints:
-        - websecure
-      service: ${PREFIX}scale-to-zero-activator
-      priority: 500
-      tls:
-        certResolver: cloudflare
-"
-done
-
-cat > /opt/traefik/dynamic.yml << EOF
+cat > /opt/traefik/dynamic/platform.yml << EOF
 http:
   routers:
     ${API_SERVICE_NAME}:
@@ -458,7 +433,6 @@ http:
       tls:
         certResolver: cloudflare
 
-${S2Z_ROUTERS}
 
   middlewares:
     ${PREFIX}strip-api-prefix:
@@ -504,7 +478,7 @@ job "traefik" {
         volumes = [
           "/opt/traefik/acme.json:/acme.json",
           "/opt/traefik/acme-http.json:/acme-http.json",
-          "/opt/traefik/dynamic.yml:/etc/traefik/dynamic.yml",
+          "/opt/traefik/dynamic:/etc/traefik/dynamic",
           "/opt/traefik/logs:/var/log/traefik"
         ]
 
@@ -537,7 +511,7 @@ job "traefik" {
           # always-front router above is what closes it.
           # server-setup.md#refresh-interval
           "--providers.nomad.refreshInterval=5s",
-          "--providers.file.filename=/etc/traefik/dynamic.yml",
+          "--providers.file.directory=/etc/traefik/dynamic",
           "--certificatesresolvers.cloudflare.acme.dnschallenge=true",
           "--certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare",
           "--certificatesresolvers.cloudflare.acme.email=${ACME_EMAIL}",
@@ -661,6 +635,11 @@ export TRAEFIK_ACCESS_LOG_PATH="/opt/traefik/logs/access.log"
 ANALYTICS_DIR="/opt/hostnsoft-analytics/${APP_ENV}"
 mkdir -p "${ANALYTICS_DIR}"
 chown "${APP_USER}:${APP_USER}" "${ANALYTICS_DIR}"
+# Must match the activator service name written into platform.yml above —
+# it carries the APP_ENV prefix, and deploy-service generates routers that
+# reference it by name. server-setup.md#s2z-routers
+export ACTIVATOR_SERVICE_NAME="${PREFIX}scale-to-zero-activator"
+export TRAEFIK_DYNAMIC_DIR="/opt/traefik/dynamic"
 export ANALYTICS_DB_PATH="${ANALYTICS_DIR}/analytics.db"
 
 # Per-app persistent storage, bind-mounted to /data. Exists so app data is
@@ -750,6 +729,28 @@ for svc_dir in "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_N
     sudo -u "${APP_USER}" bash -c "cd '${svc_dir}' && npx prisma migrate deploy"
   fi
 done
+
+# Seed the scale-to-zero router file. Needs the repo pulled, .env generated
+# and node_modules installed, so it runs here rather than beside the rest of
+# the Traefik config. Non-fatal: without it a stopped allowlisted app 404s
+# until the next deploy regenerates the file, which is bad but not an
+# outage. server-setup.md#s2z-routers
+if [[ -f "${APP_HOME}/${DEPLOY_SERVICE_NAME}/scale-to-zero-registry.js" ]]; then
+  echo "--> Generating scale-to-zero Traefik routers"
+  sudo -u "${APP_USER}" bash -c "cd '${APP_HOME}/${DEPLOY_SERVICE_NAME}' && node scale-to-zero-registry.js" \
+    || echo "    WARNING: could not generate scale-to-zero routers (stopped apps would 404 until the next deploy)"
+else
+  echo ""
+  echo "!! scale-to-zero-registry.js is NOT in this checkout of ${DEPLOY_SERVICE_NAME}."
+  echo "!! Traefik has just been switched to the DIRECTORY provider, which expects"
+  echo "!! that script to write /opt/traefik/dynamic/scale-to-zero.yml. Without it"
+  echo "!! NO app has a wake router: every allowlisted app 404s the moment the idle"
+  echo "!! watcher stops it — within IDLE_THRESHOLD_MIN (${IDLE_THRESHOLD_MIN}m), silently."
+  echo "!!"
+  echo "!! Merge the scale-to-zero Step 7 branch into '${APP_ENV}' and re-run this."
+  echo "!! Until then, disable the idle watcher:  systemctl stop ${IDLE_WATCHER_UNIT:-embarko-idle-${APP_ENV}}.timer"
+  echo ""
+fi
 
 
 # ---------------------------------------------------------------------------

@@ -67,6 +67,10 @@ API_PORT=$((4100 + PORT_OFFSET))
 PM2_DEPLOY_NAME="${APP_ENV}-deploy-service"
 PM2_API_NAME="${APP_ENV}-api-service"
 PM2_ACTIVATOR_NAME="${APP_ENV}-activator"
+# Set to 1 once the activator answers. A failure is reported at the END of
+# the run, not raised here: aborting mid-deploy would leave api-service
+# un-restarted, which is worse than finishing and failing loudly.
+ACTIVATOR_HEALTHY=0
 ACTIVATOR_PORT=$((4200 + PORT_OFFSET))
 APP_HOME="${APP_HOME:-/home/${APP_USER}}"
 DEPLOY_DIR="${APP_HOME}/${DEPLOY_SERVICE_NAME}"
@@ -247,8 +251,24 @@ if [[ -f "${DEPLOY_DIR}/activator.js" ]]; then
     pm2 start "${DEPLOY_DIR}/activator.js" --name "${PM2_ACTIVATOR_NAME}" --cwd "${DEPLOY_DIR}"
     pm2 save
   fi
+
+  # Smoke test. pm2 reporting "online" only means the process was spawned,
+  # not that it can serve — a parse error and a require-time throw both
+  # shipped past that this week. Checked here so a broken activator fails
+  # the DEPLOY rather than surfacing when a user hits a sleeping app hours
+  # later. server-setup.md#activator-watchdog
+  echo "--> Waiting for ${PM2_ACTIVATOR_NAME} to answer its health check"
+  for _ in $(seq 1 20); do
+    if curl -sf --max-time 3 "http://127.0.0.1:${ACTIVATOR_PORT}/__activator/health" >/dev/null 2>&1; then
+      ACTIVATOR_HEALTHY=1; break
+    fi
+    sleep 1
+  done
 else
   echo "--> No activator.js in this checkout — skipping ${PM2_ACTIVATOR_NAME}"
+  # Nothing to check, so nothing to fail on. Only an activator that EXISTS
+  # and cannot serve is an error.
+  ACTIVATOR_HEALTHY=1
 fi
 
 # ---------------------------------------------------------------------
@@ -292,7 +312,27 @@ echo "--> Restarting ${PM2_API_NAME}"
 export PORT="$API_PORT"
 pm2 restart "${PM2_API_NAME}" --update-env
 
+if [[ "$ACTIVATOR_HEALTHY" != 1 ]]; then
+  echo ""
+  echo "!! ${PM2_ACTIVATOR_NAME} DID NOT answer its health check."
+  echo "!! Everything else deployed. But scale-to-zero apps cannot be woken:"
+  echo "!! a request for a STOPPED app will 502 until this is fixed."
+  echo "!!"
+  echo "!!   pm2 logs ${PM2_ACTIVATOR_NAME} --err --lines 40"
+  echo "!!   node --check ${DEPLOY_DIR}/activator.js"
+  echo "!!"
+  echo "!! To stop apps being put to sleep until it is working:"
+  echo "!!   sudo systemctl stop embarko-idle-${APP_ENV}.timer"
+  echo ""
+fi
+
 echo "=================================================================="
 echo " Redeploy complete — environment: ${APP_ENV}"
 echo " Existing customer app Nomad jobs were not touched by this script."
 echo "=================================================================="
+
+# Non-zero exit so CI or a careful operator cannot miss it, AFTER the
+# summary above so the reason is on screen.
+if [[ "$ACTIVATOR_HEALTHY" != 1 ]]; then
+  exit 1
+fi

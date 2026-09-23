@@ -638,6 +638,46 @@ installed by `scale-to-zero-soak.sh`, to force many cycles per day. Its
 
 ---
 
+## <a id="activator-watchdog"></a>Keeping the activator alive
+
+Under the routing chosen on 2026-09-23 the activator is NOT in the path of
+a running app — Traefik goes direct, and the activator only catches a
+hostname once its app is stopped. So an activator outage does not break
+running apps. It does mean **every sleeping app is unreachable and cannot
+be woken** until it returns, which to the user is a dead site.
+
+Four layers, in order of what actually fails.
+
+**1. Deploy-time smoke test.** `redeploy.sh` and `server-setup.sh` both
+poll `/__activator/health` for 20s after restarting it. pm2 reporting
+"online" only means the process was spawned — a parse error and a
+require-time throw both shipped straight past that in one week. `redeploy.sh`
+exits non-zero on failure, but only AFTER finishing: aborting mid-run would
+leave api-service un-restarted, which is worse. Both print how to stop the
+idle watcher so nothing is put to sleep while waking is broken.
+
+**2. pm2 backoff.** pm2 gives up after `max_restarts` (15) by default,
+which is precisely wrong for a startup crash — the process would stay down
+permanently. `exp_backoff_restart_delay` keeps it retrying instead.
+
+**3. `max_memory_restart: 256M`.** Caps a leak before it becomes an OOM on
+a 7.8GB box. It runs at ~70MB serving four apps, so this is headroom, not
+a tight limit.
+
+**4. A watchdog timer, every 2 minutes.** The gap pm2 cannot cover: a
+process that is WEDGED rather than crashed is still "online" to pm2 while
+serving nothing. The watchdog probes health TWICE, five seconds apart,
+before restarting — a single failure during a deploy restart is normal and
+must not trigger another restart on top of it.
+
+**Cost.** The health endpoint makes no Nomad call, reads no disk, and logs
+nothing — at one check every two minutes, logging it would add ~720 lines
+a day to a log we only just started rotating. The watchdog is one `curl`
+per two minutes. Neither is measurable against a box running forty-eight
+apps.
+
+---
+
 ## <a id="docker-gc"></a>Docker GC timer
 
 An image that declares `VOLUME` in its Dockerfile gets a fresh

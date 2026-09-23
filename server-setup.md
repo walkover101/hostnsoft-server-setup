@@ -558,6 +558,25 @@ sessions survive, which is why the script kept running, but reconnecting
 afterwards was impossible without console access. **Do not reorder those
 lines.**
 
+### <a id="ufw-lock"></a>xtables lock contention
+
+`ufw` drives iptables, and Docker rewrites its iptables rules extensively
+when it restarts — which this script does a few steps earlier. On
+2026-09-23 that collided: `ERROR: initcaps / Another app is currently
+holding the xtables lock`, and `set -e` aborted the entire run at the
+firewall step. Everything after it was silently skipped: the Traefik job,
+the pm2 ecosystem file, and all three systemd timers.
+
+Each `ufw` call now retries for up to a minute, the same treatment
+`wait_for_apt_lock` gives dpkg. If it still fails, it exits with the
+command to find the holder (`lsof /run/xtables.lock`) rather than a bare
+iptables error.
+
+Worth noting what made this bad rather than annoying: the failure was
+LOUD but its consequence was not. The script stopped with a visible
+error, and what that error cost — three timers never installed — was
+several screens further from the eye than the error itself.
+
 On OpenStack-based clouds, ufw only controls the firewall *inside* the VM.
 The provider's security group must also allow 80/443 in **both** ingress
 and egress.

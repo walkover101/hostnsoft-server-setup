@@ -801,10 +801,31 @@ sudo -u "${APP_USER}" bash -c "
 #    three lines — getting it wrong locks you out. server-setup.md#firewall
 # ---------------------------------------------------------------------------
 echo "--> Configuring firewall (OS-level, via ufw)"
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw --force enable
+
+# Retry on xtables lock contention, same shape as wait_for_apt_lock. ufw
+# drives iptables, and Docker rewrites its rules extensively when it
+# restarts a few steps above — so the lock is genuinely likely to be held
+# right here. Without this, `set -e` aborts the whole run at the firewall
+# and everything after it (Traefik, pm2, all three timers) is skipped.
+# Happened on 2026-09-23. server-setup.md#ufw-lock
+ufw_retry() {
+  local attempts=0
+  until ufw "$@"; do
+    attempts=$((attempts + 1))
+    if [[ $attempts -ge 12 ]]; then
+      echo "ERROR: 'ufw $*' failed after ${attempts} attempts — xtables lock still held." >&2
+      echo "       Check what holds it:  sudo lsof /run/xtables.lock" >&2
+      exit 1
+    fi
+    echo "    ufw busy (xtables lock, likely Docker) — retrying in 5s (attempt ${attempts})"
+    sleep 5
+  done
+}
+
+ufw_retry allow 22/tcp
+ufw_retry allow 80/tcp
+ufw_retry allow 443/tcp
+ufw_retry --force enable
 
 echo ""
 echo "!! IMPORTANT if running on an OpenStack-based cloud (e.g. NeevCloud):"

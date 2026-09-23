@@ -1,19 +1,12 @@
 #!/usr/bin/env bash
-# redeploy.sh — pull the latest deploy-service + api-service code, bring
-# their .env files up to date, and restart them. Does NOT touch
-# Nomad/Docker/Traefik or any running customer app job — that is
-# server-setup.sh's job, and only for provisioning or a real infra change.
+# redeploy.sh — pull both services, refresh their .env, restart them.
+# Touches no Nomad/Docker/Traefik and no customer app.
 #
-#   bash redeploy.sh prod
-#   bash redeploy.sh test
+#   bash redeploy.sh prod|test|demo
 #
-# One file for every environment. It reads <env>.set-env.sh for APP_USER
-# and DOMAIN, and <env>.variables.sh only if a .env actually needs
-# rebuilding — a routine redeploy touches no secrets at all.
-#
-# Run as APP_USER, never with sudo: git, docker, npm and pm2 all work
-# with that user's own permissions here, and root would leave root-owned
-# files behind in their checkouts.
+# Run as APP_USER, never sudo. For anything in Traefik config, nomad.hcl,
+# timers or ports use server-setup.sh instead — it is a SUPERSET of this
+# for code, so never run both. See README.md "Which script to run".
 
 set -euo pipefail
 
@@ -87,42 +80,24 @@ echo " deploy-service : ${DEPLOY_SERVICE_NAME}  (pm2: ${PM2_DEPLOY_NAME})"
 echo " api-service    : ${API_SERVICE_NAME}  (pm2: ${PM2_API_NAME})"
 echo "=================================================================="
 
-# ---------------------------------------------------------------------
-# 1. Pull both repos FIRST.
-#
-# The .env check below has to run against the .env.example this commit
-# ships, not the one from before the pull — a commit that introduces a
-# new required variable is exactly the case that used to slip through
-# and only surface as a crash on restart.
-# ---------------------------------------------------------------------
+# Pull FIRST: the .env check must run against the .env.example this
+# commit ships, not the previous one.
 for dir in "$DEPLOY_DIR" "$API_DIR"; do
   echo "--> Pulling ${dir}"
   git -C "$dir" pull
 done
 
-# ---------------------------------------------------------------------
-# 2. Bring each .env up to date with its (just-pulled) .env.example.
-#
-# Only rebuilds a .env that is actually missing a key, so a routine
-# redeploy neither rewrites the file nor needs any secret. When a rebuild
-# IS needed, variables.sh supplies the real values and derive_env_vars
-# recomputes everything server-setup.sh derives — skipping that would
-# write a .env that had quietly lost them.
-# ---------------------------------------------------------------------
+# Rebuild a .env only if it is missing a key or has the wrong PORT.
+# derive_env_vars recomputes what server-setup.sh derives.
 NEEDS_HYDRATE=()
 for spec in "${DEPLOY_DIR}:deploy-service" "${API_DIR}:api-service"; do
   dir="${spec%%:*}"; label="${spec##*:}"
   [[ -d "$dir" ]] || continue
   missing="$(env_missing_keys "$dir")"
 
-  # A present-but-WRONG value is invisible to the missing-key check, and
-  # PORT is the one where that is catastrophic rather than cosmetic: the
-  # two services must bind the two ports Traefik's routes point at, or
-  # ship.embarko.ai 502s, /api reaches the wrong process, and the loser
-  # crash-loops unable to bind. That is exactly what happened on
-  # 2026-09-17, when a global `export PORT=4100` in variables.sh put
-  # api-service's port into deploy-service's .env. Verified explicitly
-  # here so a redeploy REPAIRS it instead of restarting into it.
+  # PORT is verified explicitly: a wrong-but-present value passes the
+  # missing-key check, and the two services must bind the ports Traefik
+  # points at. That was the 2026-09-17 outage. server-setup.md#unset-port
   if [[ "$label" == "deploy-service" ]]; then expected_port="$DEPLOY_PORT"; else expected_port="$API_PORT"; fi
   actual_port="$(grep -m1 '^PORT=' "${dir}/.env" 2>/dev/null | cut -d= -f2- || true)"
 
@@ -164,10 +139,7 @@ fi
 # ---------------------------------------------------------------------
 cd "$DEPLOY_DIR"
 
-# Nomad references this image by a fixed tag with force_pull=false (see
-# nomad-job-spec.js), so a git pull alone never rebuilds it. Only built
-# when orphan-proxy/ actually exists, the same condition server-setup.sh
-# uses.
+# force_pull=false, so a git pull alone never rebuilds this.
 if [[ -d "${DEPLOY_DIR}/orphan-proxy" ]]; then
   echo "--> Rebuilding orphan-banner-proxy sidecar image"
   docker build -t orphan-banner-proxy:local "${DEPLOY_DIR}/orphan-proxy"
@@ -178,28 +150,19 @@ fi
 # require() from this commit crashes the process even though the pull
 # itself was clean.
 echo "--> Installing dependencies"
-# --include=dev, not a bare install: if NODE_ENV=production is exported
-# (it was, globally, in variables.sh), npm omits devDependencies and
-# strips typescript — so `npm run build` dies with "tsc: not found" and
-# this script aborts BEFORE restarting anything. Explicit here so the
-# build cannot break again on whatever NODE_ENV happens to be set.
+# --include=dev: NODE_ENV=production makes npm omit typescript, so the
+# build dies with "tsc: not found". server-setup.md#npm-install
 npm install --include=dev
 
-# Generic detection rather than hardcoding which service compiles: a pull
-# only updates source, so for a compiled service the restart re-executes
-# the PREVIOUS build until this runs — silently serving stale code after a
-# successful pull. That happened here before this step existed.
+# Generic: a compiled service would otherwise re-execute the PREVIOUS
+# build after a clean pull.
 if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
   echo "--> ${DEPLOY_DIR} has a build script — running it"
   npm run build
 fi
 
-# Regenerate the scale-to-zero Traefik routers from the registry. Here as
-# well as in server-setup.sh: the router file is derived from deploy-service
-# code and the registry, both of which a redeploy can change, and needing a
-# full re-provision to fix routing would defeat the point of Step 7.
-# Non-fatal — a stopped allowlisted app would 404 until the next run.
-# server-setup.md#s2z-routers
+# Routers are derived from deploy-service code plus the registry, both of
+# which a redeploy can change. Non-fatal. server-setup.md#s2z-routers
 if [[ -f "${DEPLOY_DIR}/scale-to-zero-registry.js" ]]; then
   echo "--> Regenerating scale-to-zero Traefik routers"
   (cd "$DEPLOY_DIR" && node scale-to-zero-registry.js) \
@@ -214,16 +177,9 @@ find "$DEPLOY_DIR" -name '*.js' -not -path '*/node_modules/*' -print0 \
   | xargs -0 -n1 node --check
 
 echo "--> Restarting ${PM2_DEPLOY_NAME}"
-# PORT is set explicitly here, immediately before the restart, and NOT
-# left to .env. `--update-env` hands pm2 this shell's environment, and
-# dotenv does NOT override a variable that is already set — so any stale
-# PORT exported in the operator's shell (for example from sourcing an
-# older variables.sh) silently wins over the correct value in .env. That
-# is precisely how deploy-service ended up bound to api-service's port on
-# 2026-09-17 even after .env had been corrected: the file was right and
-# the process still came up wrong.
-#
-# Setting it per service here makes the inherited value irrelevant.
+# PORT set here, not left to .env: --update-env hands pm2 this shell's
+# environment and dotenv does not override an already-set variable.
+# server-setup.md#unset-port
 export PORT="$DEPLOY_PORT"
 pm2 restart "${PM2_DEPLOY_NAME}" --update-env
 
@@ -277,18 +233,12 @@ fi
 cd "$API_DIR"
 
 echo "--> Installing dependencies"
-# --include=dev, not a bare install: if NODE_ENV=production is exported
-# (it was, globally, in variables.sh), npm omits devDependencies and
-# strips typescript — so `npm run build` dies with "tsc: not found" and
-# this script aborts BEFORE restarting anything. Explicit here so the
-# build cannot break again on whatever NODE_ENV happens to be set.
+# --include=dev: NODE_ENV=production makes npm omit typescript.
+# server-setup.md#npm-install
 npm install --include=dev
 
-# npm install only regenerates the Prisma Client via @prisma/client's
-# postinstall, which fires only when npm actually installs something. A
-# schema-only change makes npm install a no-op, leaving the client stale
-# and the build failing on a model it doesn't know about. Unconditional
-# and before the build; it's a cheap no-op when nothing changed.
+# npm install is a no-op on a schema-only change, leaving the client
+# stale. Unconditional, and before the build.
 if [[ -f "${API_DIR}/prisma/schema.prisma" ]]; then
   echo "--> Regenerating Prisma Client"
   npx prisma generate

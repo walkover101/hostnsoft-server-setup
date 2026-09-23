@@ -772,9 +772,8 @@ fi
 # ---------------------------------------------------------------------------
 echo "--> Configuring log rotation (Traefik access log + pm2)"
 
-# copytruncate, NOT rename: Traefik holds this file open from inside its
-# container, so a rename would leave it writing to the rotated file. The
-# analytics tailer detects the truncation by inode+offset and resumes.
+# copytruncate: Traefik holds the file open from inside its container, and
+# the analytics tailer detects the truncation. server-setup.md#log-rotation
 cat > /etc/logrotate.d/embarko-traefik << EOF
 /opt/traefik/logs/access.log {
   daily
@@ -806,12 +805,8 @@ sudo -u "${APP_USER}" bash -c "
 # ---------------------------------------------------------------------------
 echo "--> Configuring firewall (OS-level, via ufw)"
 
-# Retry on xtables lock contention, same shape as wait_for_apt_lock. ufw
-# drives iptables, and Docker rewrites its rules extensively when it
-# restarts a few steps above — so the lock is genuinely likely to be held
-# right here. Without this, `set -e` aborts the whole run at the firewall
-# and everything after it (Traefik, pm2, all three timers) is skipped.
-# Happened on 2026-09-23. server-setup.md#ufw-lock
+# Retry on xtables lock contention: Docker rewrites iptables when it
+# restarts a few steps above. server-setup.md#ufw-lock
 ufw_retry() {
   local attempts=0
   until ufw "$@"; do
@@ -1095,6 +1090,41 @@ echo "    A   ${DEPLOY_HOST}   -> ${SERVER_IP}"
 echo "    A   *.${APPS_DOMAIN_SUFFIX}   -> ${SERVER_IP}"
 echo "    A   ${EDGE_HOSTNAME}   -> ${SERVER_IP}   (custom-domain CNAME target — keep this one UNPROXIED if using a CDN in front of DNS)"
 
+# Postconditions — outcomes, not steps. server-setup.md#postconditions
+echo ""
+echo "--> Checking what this run actually produced"
+POSTCOND_FAILED=0
+check() {
+  local label="$1"; shift
+  if "$@" >/dev/null 2>&1; then
+    printf '    ok    %s\n' "$label"
+  else
+    printf '    FAIL  %s\n' "$label"
+    POSTCOND_FAILED=$((POSTCOND_FAILED + 1))
+  fi
+}
+timer_on()  { systemctl is-enabled --quiet "$1"; }
+pm2_online() { sudo -u "${APP_USER}" PM2_HOME="${APP_HOME}/.pm2" pm2 jlist 2>/dev/null \
+                 | grep -q "\"name\":\"$1\".*\"status\":\"online\""; }
+
+check "timer ${IDLE_WATCHER_UNIT}"                timer_on "${IDLE_WATCHER_UNIT}.timer"
+check "timer ${DOCKER_GC_UNIT}"                   timer_on "${DOCKER_GC_UNIT}.timer"
+check "timer ${WATCHDOG_UNIT}"                    timer_on "${WATCHDOG_UNIT}.timer"
+check "pm2 ${PM2_DEPLOY_NAME} online"             pm2_online "${PM2_DEPLOY_NAME}"
+check "pm2 ${PM2_API_NAME} online"                pm2_online "${PM2_API_NAME}"
+check "pm2 ${PM2_ACTIVATOR_NAME} online"          pm2_online "${PM2_ACTIVATOR_NAME}"
+check "activator answers /__activator/health"     curl -sf --max-time 5 "http://127.0.0.1:${ACTIVATOR_PORT}/__activator/health"
+check "traefik job running"                       sudo -u "${APP_USER}" bash -c "nomad job status traefik | grep -q '^Status.*running'"
+check "platform.yml written"                      test -s /opt/traefik/dynamic/platform.yml
+check "scale-to-zero.yml written"                 test -s /opt/traefik/dynamic/scale-to-zero.yml
+
+if [[ "$POSTCOND_FAILED" -gt 0 ]]; then
+  echo ""
+  echo "!! ${POSTCOND_FAILED} postcondition(s) FAILED — this run did not fully succeed."
+  echo "!! Scroll up for the step that produced it. Do not treat the banner"
+  echo "!! below as a green light."
+fi
+
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
@@ -1134,3 +1164,7 @@ echo " If this is an OpenStack-based cloud (NeevCloud, etc.): double check"
 echo " your provider's Security Group allows ports 80/443 in BOTH ingress"
 echo " and egress directions — ufw alone is not sufficient there."
 echo "=================================================================="
+
+if [[ "${POSTCOND_FAILED:-0}" -gt 0 ]]; then
+  exit 1
+fi

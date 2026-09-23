@@ -587,6 +587,36 @@ sessions survive, which is why the script kept running, but reconnecting
 afterwards was impossible without console access. **Do not reorder those
 lines.**
 
+## <a id="postconditions"></a>Postcondition check
+
+The script ends by asserting what it was supposed to produce: three timers
+enabled, three pm2 processes online, the activator answering its health
+check, Traefik running, and both files present in the dynamic directory.
+Any failure prints `FAIL`, is counted, and the script exits non-zero.
+
+This exists because of a repeated pattern, not a theory. Twice in one week
+a step failed visibly and the consequence was missed anyway:
+
+- **ufw, 2026-09-23**: an xtables lock aborted the run at the firewall.
+  The error was loud, but what it cost — the Traefik job, the pm2
+  ecosystem and all three timers never installed — was several screens
+  further down.
+- **router generation, 2026-09-23**: `scale-to-zero-registry.js` threw
+  `isAlwaysFront is not a function`. Correctly non-fatal, printed a
+  WARNING, and scrolled past under two hundred lines of pm2 output. The
+  result was no wake routers for any app.
+
+A warning printed three hundred lines before the success banner is not a
+result anyone reads. This turns "did every step actually run?" from
+something inferred from scrollback into something the script states once,
+at the end.
+
+Deliberately checks OUTCOMES rather than steps — `systemctl is-enabled`, a
+live health request, a non-empty file. A step that "ran" and produced
+nothing fails here.
+
+---
+
 ### <a id="ufw-lock"></a>xtables lock contention
 
 `ufw` drives iptables, and Docker rewrites its iptables rules extensively

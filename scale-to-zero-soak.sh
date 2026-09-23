@@ -1,36 +1,16 @@
 #!/usr/bin/env bash
-# scale-to-zero-soak.sh — Step 5 of docs/scale-to-zero-gated-plan.md.
+# scale-to-zero-soak.sh — Step 5 soak harness.
 #
-#   sudo bash scale-to-zero-soak.sh prod            # start the soak
-#   sudo bash scale-to-zero-soak.sh prod --remove   # stop it, restore prod settings
+#   sudo bash scale-to-zero-soak.sh prod            # start
+#   sudo bash scale-to-zero-soak.sh prod --remove   # stop, restore prod
 #
-# Step 5 asks for the mechanism to cycle idle -> stop -> request -> wake ->
-# serve -> idle unattended for 24-48h. Two things are needed that the
-# production setup deliberately does NOT provide:
+# Adds the two things production deliberately lacks: synthetic traffic (the
+# test app has no users, so it would stop once and never wake) and a
+# 15-minute threshold via a systemd drop-in, for ~30 cycles a day instead
+# of four. Both undone by --remove, without re-provisioning.
 #
-#   1. TRAFFIC. scale-to-zero-test-1 has no real users, so on a schedule it
-#      would stop once and stay stopped forever — exercising the stop path
-#      and never the wake path, which is the half that can lose data.
-#      This installs a timer that requests it periodically.
-#
-#   2. A SHORT THRESHOLD. The production threshold is 6 hours, chosen to
-#      keep stops out of working hours. At 6h a 24h soak yields about four
-#      cycles, which is far too few to shake out a race. A drop-in
-#      overrides it to 15 minutes for the idle watcher, giving ~30 cycles a
-#      day.
-#
-# Both are deliberately temporary and both are undone by --remove. The
-# override is a systemd drop-in rather than an edit to the unit file, so
-# the next server-setup.sh run cannot silently bake the test threshold
-# into production — and --remove restores the real value without needing
-# to re-provision.
-#
-# SAFETY: this changes only the SCHEDULE and the THRESHOLD. What may be
-# stopped is still governed entirely by STOPPABLE_APPS, the frozen list
-# hardcoded in deploy-service/idle-report.js. A 15-minute threshold makes
-# nearly every app on the box report as idle — and every one of them that
-# is not on that list is still left running. That is the property the soak
-# is partly there to test.
+# Changes only the SCHEDULE and THRESHOLD — what may be stopped is still
+# scale-to-zero-apps.js. See docs/scale-to-zero-gated-plan.md Step 5.
 
 set -euo pipefail
 
@@ -79,14 +59,8 @@ echo " URL      : ${TEST_URL}"
 echo " Threshold: 15 min (overridden; production value is restored by --remove)"
 echo "=================================================================="
 
-# `systemctl cat`, NOT `systemctl list-unit-files | grep -q`. Under
-# `set -o pipefail`, `grep -q` exiting the instant it matches closes the
-# pipe, the still-writing upstream command takes SIGPIPE and exits 141,
-# and the PIPELINE reports 141 — so a successful match reads as a failure.
-# list-unit-files emits hundreds of lines and this unit sorts early, so
-# grep bails almost immediately with plenty left to write. That made this
-# check fail intermittently and then permanently (2026-09-18), reporting
-# a timer that was installed and running as missing.
+# systemctl cat, not `list-unit-files | grep -q`: under pipefail a matching
+# grep -q closes the pipe and the pipeline reports SIGPIPE as failure.
 if ! systemctl cat "${IDLE_UNIT}.timer" >/dev/null 2>&1; then
   echo "ERROR: ${IDLE_UNIT}.timer is not installed. Run server-setup.sh first." >&2
   exit 1
@@ -95,27 +69,15 @@ fi
 # --- 1. shorten the idle threshold, via a drop-in ---------------------
 mkdir -p "$DROPIN_DIR"
 cat > "${DROPIN_DIR}/soak.conf" << 'EOF'
-# Step 5 soak ONLY. Installed by scale-to-zero-soak.sh, removed by its
-# --remove. A drop-in rather than an edit to the unit file so that
-# server-setup.sh regenerating that file cannot bake this test value into
-# production, and so removing it restores the real threshold with no
-# re-provision.
+# Step 5 soak ONLY — removed by --remove. A drop-in, not a unit edit, so
+# server-setup.sh cannot bake this test value into production.
 [Service]
 Environment=IDLE_THRESHOLD_MIN=15
 EOF
 
-# --- 2. synthetic traffic --------------------------------------------
-# Every 45 minutes against a 15-minute threshold: long enough that the app
-# is reliably stopped before each request (so every request is a real cold
-# start, not a no-op against a running app), short enough for ~30 full
-# cycles a day.
-#
-# --max-time 150 matches the activator's own wake timeout plus headroom:
-# the request SHOULD be held through the cold start, and a curl that gave
-# up early would look like a failure that never happened.
-#
-# The status code and total time go to the journal, so `journalctl -u` is a
-# complete record of every cycle's outcome and latency afterwards.
+# 45min against a 15min threshold: the app is reliably stopped first, so
+# every request is a real cold start. --max-time 150 matches the wake
+# timeout, so a curl giving up early cannot look like a failure.
 cat > "/etc/systemd/system/${SOAK_UNIT}.service" << EOF
 [Unit]
 Description=Embarko scale-to-zero soak — request the test app to force a wake (${APP_ENV})
@@ -132,28 +94,11 @@ cat > "/etc/systemd/system/${SOAK_UNIT}.timer" << EOF
 Description=Request ${TEST_APP} every 45 minutes to exercise wake-on-request (${APP_ENV})
 
 [Timer]
-# OnActiveSec, NOT OnBootSec: OnBootSec is measured from BOOT, so on a box
-# that booted days ago its deadline is permanently in the past and never
-# produces a future trigger. Combined with the OnUnitInactiveSec below —
-# which needs a run inside THIS timer unit's lifetime to chain from, and
-# has none on a freshly installed unit — the timer ends up with no next
-# elapse at all: `systemctl list-timers` shows "n/a" and it never fires.
-# Seen exactly that way on 2026-09-18, including after a reinstall, since
-# removing the unit wipes systemd's record of the earlier run (the journal
-# line survives, which makes it look like the timer is still anchored).
-#
-# OnActiveSec is relative to when the TIMER starts, so installing it always
-# produces a first run, whether that is now or at boot.
+# OnActiveSec (from timer start), not OnBootSec (from boot) — an OnBootSec
+# deadline on a long-running box is already past and never fires.
 OnActiveSec=1min
-# OnUnitInactiveSec, NOT OnUnitActiveSec: this service is Type=oneshot and
-# a single run can last up to 150s (it holds the connection through a cold
-# start). OnUnitActiveSec measures from the moment the unit went active,
-# which for a long-running oneshot leaves systemd with no next elapse to
-# compute while it is still running — `systemctl list-timers` shows "n/a"
-# and the timer fires once and never again. Seen exactly that way on
-# 2026-09-18. Measuring from when the last run FINISHED also gives the
-# interval its intended meaning: 45 minutes of genuine idleness after a
-# request, comfortably past the 15-minute threshold.
+# OnUnitInactiveSec: this oneshot can run 150s, and measuring from when it
+# FINISHED also gives the interval its intended meaning.
 OnUnitInactiveSec=45min
 
 [Install]

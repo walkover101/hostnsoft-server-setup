@@ -214,19 +214,8 @@ hydrate_service_env() {
   warn_on_placeholder_values "$dir" "$label"
 }
 
-# A key added to .env.example but never exported by server-setup.sh, and
-# never set in variables.sh, silently keeps the EXAMPLE's placeholder. The
-# .env then has every key — so the missing-key check passes — and the app
-# starts with a value like app.example.com.
-#
-# That is the shape of the two worst config failures here: analytics ran
-# disabled for days because keys sat commented out, and a global PORT put
-# deploy-service on api-service's port. Both were invisible until
-# something downstream broke.
-#
-# Matches conventional placeholder markers rather than "value equals the
-# example", because many keys legitimately match their example
-# (TRAEFIK_DYNAMIC_DIR, SCALE_TO_ZERO_MODE, APP_DATA_ROOT all do).
+# A key in .env.example with no provider silently keeps the example's
+# placeholder — the .env has every key, so the missing-key check passes.
 # server-setup.md#placeholder-check
 warn_on_placeholder_values() {
   local dir="$1" label="$2"

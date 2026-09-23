@@ -1,0 +1,7 @@
+# Real per-environment configuration: these hold live credentials
+# (Cloudflare token, Stripe live key, MSG91 authkey, JWT/INTERNAL secrets).
+# Only the example.* templates belong in git. server-setup.md#secrets
+*.set-env.sh
+*.variables.sh
+!example.set-env.sh
+!example.variables.sh

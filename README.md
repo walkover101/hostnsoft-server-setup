@@ -6,7 +6,7 @@
 cp example.set-env.sh <env>.set-env.sh   # env = test | demo | prod
 # edit <env>.set-env.sh: fill in APP_ENV, DOMAIN, CF_DNS_API_TOKEN, ACME_EMAIL, DEPLOY_SERVICE_REPO, API_SERVICE_REPO
 
-cp prod.variables.sh <env>.variables.sh   # use as a template — see its own comments
+cp example.variables.sh <env>.variables.sh   # use as a template — see its own comments
 # edit <env>.variables.sh: fill in real values for whatever deploy-service/api-service's own .env.example files need
 # (DATABASE_URL, JWT_SECRET, MSG91_AUTHKEY, etc. — EDGE_HOSTNAME/ORIGIN_SERVER_IP are computed automatically, don't set them here)
 

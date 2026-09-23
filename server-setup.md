@@ -587,6 +587,43 @@ sessions survive, which is why the script kept running, but reconnecting
 afterwards was impossible without console access. **Do not reorder those
 lines.**
 
+## <a id="apply-app-config"></a>`apply-app-config.sh`
+
+Re-pushes an app's CURRENT config, regenerating its Nomad job spec with no
+deploy token and no rebuild.
+
+It calls api-service's own `applyCurrentConfig()`, so env vars, custom
+domains, memory and image tag all come from its database. Nothing is
+guessed. The alternative — calling deploy-service's
+`POST /internal/apps/:appName/config` by hand — means supplying `envVars`
+yourself, and an incomplete list silently strips the app's environment.
+
+**Why it exists.** An app only picks up a job-spec change when its spec is
+regenerated, which for most apps means their next deploy. Four apps last
+deployed 2026-09-15 were still on `DATA_DIR=/alloc/data` after the bind
+mount landed on the 17th, so scale-to-zero's guard correctly refused to
+ever stop them. `POST /env-vars/apply` does the same job but is
+company-scoped, so it cannot reach an app owned by a customer.
+
+Their data had already been copied to `$APP_DATA_ROOT` and nothing had
+written to it in two weeks, so this needed no downtime and no second copy —
+only the spec regenerated. Verified on `hostnsoft-panel-test`: `/data`,
+bind mount present, app serving 200, all three SQLite files including the
+WAL intact with their original timestamps.
+
+```bash
+sudo bash apply-app-config.sh prod --dry-run assetdesk
+sudo bash apply-app-config.sh prod assetdesk
+```
+
+The dry run reports the image it would re-push and changes nothing. The
+real run waits for placement, prints each app's `DATA_DIR` and HTTP status,
+and exits non-zero if any app is not on `/data`.
+
+Old allocation directories are never touched, so a failure is recoverable.
+
+---
+
 ## <a id="postconditions"></a>Postcondition check
 
 The script ends by asserting what it was supposed to produce: three timers

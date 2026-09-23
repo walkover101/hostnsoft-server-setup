@@ -449,6 +449,27 @@ protecting us the day anyone adds `-E`.
 
 ---
 
+## <a id="syntax-check"></a>JavaScript syntax check
+
+A service with a `build` script gets its errors from the compiler.
+`deploy-service` is plain JavaScript with no build step, so nothing caught
+a parse error until pm2 restarted into it and crash-looped — with the
+service already down by the time anyone saw it.
+
+Both scripts now run `node --check` over every `.js` file outside
+`node_modules` BEFORE restarting anything. Under `set -e` a failure aborts
+the deploy with the service still running on its previous, working code.
+
+**2026-09-22.** `scale-to-zero-registry.js` shipped with `\\\`` inside a
+template literal — a literal backslash followed by a backtick that
+terminates the literal, so the file would not parse at all. Caught by a
+manual `node --check` before deploying, which is the only reason it did not
+reach prod. The same class of mistake took deploy-service down once before,
+via a backtick inside an HCL comment in a generated job spec. Relying on
+someone remembering to run the check by hand is not a control.
+
+---
+
 ## <a id="prisma"></a>Prisma migrations
 
 Applied for whichever service actually uses Prisma, detected generically

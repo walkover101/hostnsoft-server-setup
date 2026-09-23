@@ -190,6 +190,25 @@ if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; the
   npm run build
 fi
 
+# Regenerate the scale-to-zero Traefik routers from the registry. Here as
+# well as in server-setup.sh: the router file is derived from deploy-service
+# code and the registry, both of which a redeploy can change, and needing a
+# full re-provision to fix routing would defeat the point of Step 7.
+# Non-fatal — a stopped allowlisted app would 404 until the next run.
+# server-setup.md#s2z-routers
+if [[ -f "${DEPLOY_DIR}/scale-to-zero-registry.js" ]]; then
+  echo "--> Regenerating scale-to-zero Traefik routers"
+  (cd "$DEPLOY_DIR" && node scale-to-zero-registry.js) \
+    || echo "    WARNING: could not generate scale-to-zero routers (stopped apps would 404)"
+fi
+
+# Syntax-check before restarting. deploy-service is plain JS with no build
+# step, so nothing else would catch a parse error until pm2 crash-loops on
+# it. server-setup.md#syntax-check
+echo "--> Checking deploy-service JavaScript parses"
+find "$DEPLOY_DIR" -name '*.js' -not -path '*/node_modules/*' -print0 \
+  | xargs -0 -n1 node --check
+
 echo "--> Restarting ${PM2_DEPLOY_NAME}"
 # PORT is set explicitly here, immediately before the restart, and NOT
 # left to .env. `--update-env` hands pm2 this shell's environment, and

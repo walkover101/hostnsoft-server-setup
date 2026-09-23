@@ -715,6 +715,11 @@ for svc_dir in "${APP_HOME}/${DEPLOY_SERVICE_NAME}" "${APP_HOME}/${API_SERVICE_N
   if [[ "$HAS_BUILD_SCRIPT" == "yes" ]]; then
     echo "    ${svc_dir} has a build script — running it"
     sudo -u "${APP_USER}" bash -c "cd '${svc_dir}' && npm run build"
+  else
+    # No build step means nothing would catch a parse error until pm2
+    # crash-loops on it. server-setup.md#syntax-check
+    echo "    ${svc_dir} has no build script — checking its JavaScript parses"
+    sudo -u "${APP_USER}" bash -c "find '${svc_dir}' -name '*.js' -not -path '*/node_modules/*' -print0 | xargs -0 -n1 node --check"
   fi
 done
 

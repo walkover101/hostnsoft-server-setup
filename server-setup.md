@@ -422,6 +422,35 @@ any checkout: `git reset --hard && git clean -fd` runs on every re-run.
 
 ---
 
+## <a id="placeholder-check"></a>Placeholder detection
+
+Adding a key to a service's `.env.example` is only half the job. If nothing
+exports it in `server-setup.sh` and nothing sets it in `<env>.variables.sh`,
+hydration copies the EXAMPLE'S placeholder through — and the `.env` then
+has every key, so the missing-key check passes and the app starts with
+`app.example.com`.
+
+`hydrate_service_env` now scans the file it just wrote for conventional
+placeholder markers (`example.com`, `change-me`, `203.0.113.`, `your-`,
+`REPLACE_ME`) and prints a loud block naming each one.
+
+Matched by marker rather than "value equals the example", because plenty
+of keys legitimately match theirs — `TRAEFIK_DYNAMIC_DIR`,
+`SCALE_TO_ZERO_MODE` and `APP_DATA_ROOT` all do.
+
+**When adding a key to a `.env.example`, decide which of three it is:**
+
+| Kind | Where it comes from | Example |
+|---|---|---|
+| Computed per environment | `export` in `server-setup.sh` | `APPS_DOMAIN_SUFFIX`, `ACTIVATOR_SERVICE_NAME` |
+| A secret or real URL | `export` in `<env>.variables.sh` | `JWT_SECRET`, `MSG91_AUTHKEY` |
+| Same everywhere | the `.env.example` default alone | `TRAEFIK_DYNAMIC_DIR`, `SCALE_TO_ZERO_MODE` |
+
+Only the third needs nothing. Getting it wrong used to be silent; it is
+not any more.
+
+---
+
 ## <a id="env-exports"></a>Environment exports, and the `PORT` rule
 
 Values are exported here (not just passed to pm2) so `hydrate_env_file`'s

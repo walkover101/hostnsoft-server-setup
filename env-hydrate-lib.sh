@@ -211,4 +211,36 @@ hydrate_service_env() {
   fi
   chmod 600 "${dir}/.env"
   echo "--> ${label}: wrote ${dir}/.env ($(grep -c '^[A-Za-z_][A-Za-z0-9_]*=' "${dir}/.env") key(s))"
+  warn_on_placeholder_values "$dir" "$label"
+}
+
+# A key added to .env.example but never exported by server-setup.sh, and
+# never set in variables.sh, silently keeps the EXAMPLE's placeholder. The
+# .env then has every key — so the missing-key check passes — and the app
+# starts with a value like app.example.com.
+#
+# That is the shape of the two worst config failures here: analytics ran
+# disabled for days because keys sat commented out, and a global PORT put
+# deploy-service on api-service's port. Both were invisible until
+# something downstream broke.
+#
+# Matches conventional placeholder markers rather than "value equals the
+# example", because many keys legitimately match their example
+# (TRAEFIK_DYNAMIC_DIR, SCALE_TO_ZERO_MODE, APP_DATA_ROOT all do).
+# server-setup.md#placeholder-check
+warn_on_placeholder_values() {
+  local dir="$1" label="$2"
+  local found
+  found=$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*=.*(example\.com|change-me|CHANGEME|203\.0\.113\.|your-|REPLACE_ME)' \
+    "${dir}/.env" || true)
+  [[ -z "$found" ]] && return 0
+
+  echo ""
+  echo "!! ${label}: .env still holds PLACEHOLDER values from .env.example:"
+  echo "$found" | sed 's/^/!!   /'
+  echo "!!"
+  echo "!! That key is in .env.example but nothing supplies a real value."
+  echo "!! Either export it in server-setup.sh (if it is computed) or set"
+  echo "!! it in <env>.variables.sh (if it is a secret or a real URL)."
+  echo ""
 }

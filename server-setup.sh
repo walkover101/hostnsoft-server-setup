@@ -75,6 +75,10 @@ ACTIVATOR_PORT=$((4200 + PORT_OFFSET))
 # and should be revisited with real data. server-setup.md#idle-threshold
 IDLE_THRESHOLD_MIN="${IDLE_THRESHOLD_MIN:-360}"
 
+# Megabytes of BuildKit layer cache to keep. The daily GC prunes down to
+# this. Reached 33.56GB unbounded on a 124GB disk. server-setup.md#buildkit-cache
+BUILDKIT_CACHE_KEEP_MB="${BUILDKIT_CACHE_KEEP_MB:-10000}"
+
 # pm2 process names ALWAYS carry the APP_ENV prefix, even for prod —
 # deliberately separate from DEPLOY_SERVICE_NAME/API_SERVICE_NAME above
 # (which stay bare-for-prod, used for directories/domains/Traefik, since
@@ -759,6 +763,37 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# 6b. Log rotation. Traefik's access log and pm2's logs had no ceiling at
+#     all — both grow with every request, forever. server-setup.md#log-rotation
+# ---------------------------------------------------------------------------
+echo "--> Configuring log rotation (Traefik access log + pm2)"
+
+# copytruncate, NOT rename: Traefik holds this file open from inside its
+# container, so a rename would leave it writing to the rotated file. The
+# analytics tailer detects the truncation by inode+offset and resumes.
+cat > /etc/logrotate.d/embarko-traefik << EOF
+/opt/traefik/logs/access.log {
+  daily
+  rotate 7
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+  su root root
+}
+EOF
+
+# pm2 rotates nothing on its own; this module is the supported way.
+# Idempotent — re-installing an already-present module is a no-op.
+sudo -u "${APP_USER}" bash -c "
+  pm2 install pm2-logrotate >/dev/null 2>&1 || true
+  pm2 set pm2-logrotate:max_size 50M
+  pm2 set pm2-logrotate:retain 7
+  pm2 set pm2-logrotate:compress true
+" || echo "    WARNING: could not configure pm2-logrotate (pm2 logs will grow unbounded)"
+
+# ---------------------------------------------------------------------------
 # 7. Firewall — 22, 80, 443 public; neither service's port is opened (both
 #    bind 127.0.0.1, reachable only via Traefik).
 #
@@ -918,6 +953,12 @@ After=docker.service
 Type=oneshot
 ExecStart=/usr/bin/docker volume prune -f
 ExecStart=/usr/bin/docker image prune -f
+# Leading '-': a failure here is ignored. If the buildkit container is not
+# running, this exec fails, and it must not abort the volume/image prunes
+# that already ran. --keep-storage is in MEGABYTES in this buildctl; "10GB"
+# is rejected outright, which at least fails loudly rather than silently
+# keeping everything. server-setup.md#buildkit-cache
+ExecStart=-/usr/bin/docker exec buildkit buildctl prune --keep-storage ${BUILDKIT_CACHE_KEEP_MB}
 EOF
 
 cat > "/etc/systemd/system/${DOCKER_GC_UNIT}.timer" << EOF

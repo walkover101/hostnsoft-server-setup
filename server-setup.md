@@ -230,6 +230,33 @@ does not. Not a bind mount: the cache is BuildKit's private format,
 nothing else reads it, and a named volume needs no host path created or
 chowned. BuildKit runs its own GC inside the volume, so it stays bounded.
 
+### <a id="buildkit-cache"></a>Bounding the cache
+
+The `buildkit-cache` volume solved doubled build times but was unbounded,
+and BuildKit's own GC does not hold it anywhere sensible on a large disk:
+**33.56GB, all of it reclaimable, on a 124GB disk by 2026-09-23** — two
+days after the volume was introduced at 8.7GB. It drove the disk from 32%
+to 54% in a day and was invisible to the other two prunes: `docker volume
+prune` skips it because it has a live link, and it is not an image.
+
+The daily Docker GC now prunes it to `BUILDKIT_CACHE_KEEP_MB` (10000).
+
+Two details that cost time to establish:
+
+- **`--keep-storage` is in MEGABYTES** in this buildctl. `10GB` is
+  rejected with a parse error, which is the good outcome — a value it
+  accepted but misread would silently keep everything.
+- The ExecStart carries a leading `-` so a failure is ignored. If the
+  buildkit container is not running, that exec fails, and it must not
+  abort the volume and image prunes that already succeeded.
+
+Measure it without walking the filesystem — `du` on this volume takes
+minutes, BuildKit answers from its own metadata instantly:
+
+```bash
+docker exec buildkit buildctl du | tail -2
+```
+
 ---
 
 ## <a id="traefik"></a>Traefik
@@ -347,6 +374,39 @@ before adding:
 ```bash
 nomad job inspect <app> | grep -o 'Host(`[^`]*`)' | sort -u
 ```
+
+---
+
+## <a id="log-rotation"></a>Log rotation
+
+Two things on this box grew with every request and had no ceiling at all.
+
+**Traefik's access log.** Every request across every app, in JSON, plus
+constant credential-scanner traffic. Rotated daily, 7 kept, compressed.
+
+`copytruncate` rather than rename, because Traefik holds the file open
+from inside its container — a rename would leave it writing to the rotated
+file and the live one would stay empty forever. The analytics tailer
+handles this: it tracks inode AND byte offset, treats `size < offset` as a
+rotation and restarts at 0, so `copytruncate` costs at most a few lines
+around the rotation rather than the whole stream.
+
+**pm2's logs.** pm2 rotates nothing by default. `pm2-logrotate` at 50MB,
+7 retained, compressed. This matters more since the activator started
+proxying live traffic — it logs a line per request for every allowlisted
+app.
+
+Already bounded, for contrast, and worth knowing so they are not chased
+next time disk climbs: the analytics database (`analytics/retention.js`),
+scale-to-zero snapshots (`SNAPSHOT_RETAIN_COUNT`), anonymous Docker
+volumes and dangling images (the daily GC), BuildKit's cache
+([above](#buildkit-cache)), and Nomad allocation directories (Nomad's own
+GC).
+
+Still only partly bounded: per-app images. `IMAGE_RETAIN_COUNT` applies
+when an app is DEPLOYED, so an app deployed once and never again keeps
+everything — `prune-app-images.sh` exists for exactly that and is manual
+on purpose.
 
 ---
 

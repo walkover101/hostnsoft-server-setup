@@ -642,6 +642,10 @@ chown "${APP_USER}:${APP_USER}" "${ANALYTICS_DIR}"
 # Must match the activator service name written into platform.yml above —
 # it carries the APP_ENV prefix, and deploy-service generates routers that
 # reference it by name. server-setup.md#s2z-routers
+# allowlist | universal. Universal makes every running app eligible except
+# platform jobs, hardcoded exclusions, opt-outs, and WebSocket apps.
+# server-setup.md#universal-mode
+export SCALE_TO_ZERO_MODE="${SCALE_TO_ZERO_MODE:-allowlist}"
 export ACTIVATOR_SERVICE_NAME="${PREFIX}scale-to-zero-activator"
 export TRAEFIK_DYNAMIC_DIR="/opt/traefik/dynamic"
 export ANALYTICS_DB_PATH="${ANALYTICS_DIR}/analytics.db"

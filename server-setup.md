@@ -657,6 +657,56 @@ installed by `scale-to-zero-soak.sh`, to force many cycles per day. Its
 
 ---
 
+## <a id="universal-mode"></a>`SCALE_TO_ZERO_MODE`
+
+`allowlist` (default) — only apps in `scale-to-zero-apps.js` or that opted
+in via `X-Scale-To-Zero: true` may sleep.
+
+`universal` — every running app may, minus four exclusions.
+
+### What universal excludes, and why each exists
+
+1. **Platform jobs and a hardcoded list** (`EXCLUDED_APPS`). Changing it
+   takes a code review, which is the point.
+2. **Explicit opt-outs.** `X-Scale-To-Zero: false` is RECORDED, not just
+   absent — in universal mode an app is eligible by default, so forgetting
+   the record would silently re-enrol it on the next pass.
+3. **WebSocket apps**, detected automatically as any app that has served an
+   HTTP **101** in the last 7 days. This is the one failure universal mode
+   introduces that the allowlist never could: idle detection reads
+   Traefik's access log, and Traefik logs a WebSocket request only when the
+   connection CLOSES. An app with users connected for six hours produces no
+   log line at all and reads as perfectly idle — stopping it drops every
+   live connection. `boy-and-dog-server` is also on the hardcoded list as
+   belt and braces.
+4. **Anything failing the per-stop guards**, unchanged: missing image,
+   unsaveable spec, or a `DATA_DIR` still on an allocation directory with
+   files in it.
+
+If analytics is unavailable, WebSocket apps cannot be identified, and
+universal mode **falls back to the allowlist** rather than guessing. Same
+if Nomad cannot be listed. The seed list is the floor: no data and no
+outage can remove an app from it.
+
+### Routing differs by how an app got there
+
+Seed apps route at `priority: 500` — the activator permanently in front,
+no post-stop 502 window. They have run that way since 2026-09-21.
+
+Universal apps route at `priority: 1`, BELOW the ~25-44 Traefik derives
+from an app router's rule length, so a running app is reached directly and
+the activator only catches the hostname once the app stops. That
+reintroduces a ~5s window after each stop where Traefik still points at a
+dead allocation.
+
+That is a deliberate trade, made on 2026-09-23: always-front for
+forty-eight apps would put a process written that week in the path of
+every request on the box, and an activator failure would take down running
+apps rather than just sleeping ones. Worth revisiting once the watchdog
+and deploy-time smoke test have some history behind them.
+
+---
+
 ## <a id="activator-watchdog"></a>Keeping the activator alive
 
 Under the routing chosen on 2026-09-23 the activator is NOT in the path of

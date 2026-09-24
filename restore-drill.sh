@@ -97,17 +97,22 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Restore
 # ---------------------------------------------------------------------------
+# The path inside a snapshot depends on the mode the backup ran in:
+# APP_DATA_ROOT directly (stopped), under the LVM mount (lvm), or under
+# the staging root (sqlite-safe). Rather than encode all three and go
+# stale the next time a mode is added, restore everything and scan it —
+# the whole dataset is tens of megabytes.
 if [[ -n "$ONE_APP" ]]; then
   say "Restoring ${ONE_APP} into ${SCRATCH}"
-  restic restore "$LATEST" --target "$SCRATCH" --include "${APP_DATA_ROOT}/${ONE_APP}" >/dev/null
+  restic restore "$LATEST" --target "$SCRATCH" --include "*/${ONE_APP}/*" >/dev/null
 else
-  say "Restoring all app data into ${SCRATCH}"
-  restic restore "$LATEST" --target "$SCRATCH" --include "${APP_DATA_ROOT}" >/dev/null
+  say "Restoring the full snapshot into ${SCRATCH}"
+  restic restore "$LATEST" --target "$SCRATCH" >/dev/null
 fi
 
-RESTORED_ROOT="${SCRATCH}${APP_DATA_ROOT}"
-if [[ ! -d "$RESTORED_ROOT" ]]; then
-  echo "FAIL: restore produced nothing at ${RESTORED_ROOT}." >&2
+RESTORED_ROOT="$SCRATCH"
+if [[ -z "$(find "$SCRATCH" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  echo "FAIL: restore produced nothing." >&2
   exit 1
 fi
 pass "restore completed ($(du -sh "$RESTORED_ROOT" 2>/dev/null | cut -f1))"

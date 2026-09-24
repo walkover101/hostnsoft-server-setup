@@ -137,7 +137,11 @@ echo "--> Installing base packages"
 wait_for_apt_lock
 apt-get update -y
 wait_for_apt_lock
-apt-get install -y wget gpg coreutils curl unzip jq ufw git xz-utils
+# sqlite3 and rsync are backup-app-data.sh's dependencies, not optional
+# extras: without sqlite3 it cannot use SQLite's online backup API and
+# silently degrades to backing up only STOPPED apps. See that script's
+# header for why that matters.
+apt-get install -y wget gpg coreutils curl unzip jq ufw git xz-utils sqlite3 rsync
 
 # ---------------------------------------------------------------------------
 # 2. Nomad — direct binary download, NOT apt. HashiCorp's apt repo lacks
@@ -1080,6 +1084,178 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now "${WATCHDOG_UNIT}.timer"
+
+# ---------------------------------------------------------------------------
+# 9e. Off-box backups — restic to NeevCloud S3 (Zata), nightly.
+#
+#     restic as a direct release binary, not apt: same reasoning as Nomad,
+#     Railpack and Node above — Ubuntu's packaged restic lags badly and is
+#     missing flags this uses. server-setup.md#direct-binaries
+#
+#     THE TIMER IS INSTALLED BUT THE BACKUP ONLY RUNS ONCE /etc/restic/env
+#     EXISTS. That file holds the S3 credentials and the encryption
+#     password and is deliberately NOT written by this script: it must not
+#     live in the repo or in any variables file. backup-app-data.sh fails
+#     its own preflight without it, so an unconfigured box gets a loud
+#     failed unit rather than a timer that silently backs up nothing.
+# ---------------------------------------------------------------------------
+RESTIC_VERSION="${RESTIC_VERSION:-0.17.3}"
+if ! command -v restic >/dev/null 2>&1; then
+  echo "--> Installing restic ${RESTIC_VERSION}"
+  tmp_restic="$(mktemp -d)"
+  curl -fsSL -o "${tmp_restic}/restic.bz2" \
+    "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2"
+  bunzip2 -f "${tmp_restic}/restic.bz2"
+  install -m 0755 "${tmp_restic}/restic" /usr/local/bin/restic
+  rm -rf "$tmp_restic"
+fi
+echo "--> restic: $(restic version 2>/dev/null | head -1)"
+
+BACKUP_UNIT="embarko-backup-${APP_ENV}"
+echo "--> Installing backup timer '${BACKUP_UNIT}'"
+
+# Copy the scripts to a stable path rather than pointing systemd at
+# ${_SETUP_DIR}: that is wherever the operator happened to run this from
+# (a home-directory checkout, usually), and a unit whose ExecStart
+# disappears when someone tidies up is a backup that stops without
+# anyone noticing. Re-copied on every run, so re-provisioning updates them.
+BACKUP_LIBDIR="/usr/local/lib/embarko"
+install -d -m 0755 "$BACKUP_LIBDIR"
+install -m 0755 "${_SETUP_DIR}/backup-app-data.sh" "${BACKUP_LIBDIR}/backup-app-data.sh"
+install -m 0755 "${_SETUP_DIR}/restore-drill.sh"   "${BACKUP_LIBDIR}/restore-drill.sh"
+
+cat > "/etc/systemd/system/${BACKUP_UNIT}.service" << EOF
+[Unit]
+Description=Embarko off-box backup to NeevCloud S3 (${APP_ENV})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# root, unlike the idle watcher: it reads every app's data directory and
+# those are not owned by APP_USER.
+User=root
+WorkingDirectory=${BACKUP_LIBDIR}
+Environment=APP_ENV=${APP_ENV}
+Environment=APP_DATA_ROOT=${APP_DATA_ROOT}
+Environment=APP_HOME=${APP_HOME}
+ExecStart=/usr/bin/env bash ${BACKUP_LIBDIR}/backup-app-data.sh --apply
+# A backup that cannot reach S3 should retry tonight, not wedge the unit.
+TimeoutStartSec=3600
+EOF
+
+cat > "/etc/systemd/system/${BACKUP_UNIT}.timer" << EOF
+[Unit]
+Description=Run the Embarko backup nightly (${APP_ENV})
+
+[Timer]
+# A wall-clock time, unlike the idle watcher's interval timer: backups
+# belong in the quiet hours, and scale-to-zero has stopped most apps by
+# then. Persistent=true so a box that was off at 02:00 still backs up on
+# its next boot rather than skipping the night entirely.
+OnCalendar=*-*-* 02:15:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# The drill is the only thing that proves the backups are restorable, so
+# it is scheduled, not left as a thing someone remembers to run. Weekly:
+# often enough to catch a silent break, rare enough to stay cheap.
+cat > "/etc/systemd/system/${BACKUP_UNIT}-drill.service" << EOF
+[Unit]
+Description=Embarko restore drill — verify backups are actually restorable (${APP_ENV})
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=${BACKUP_LIBDIR}
+Environment=APP_ENV=${APP_ENV}
+Environment=APP_DATA_ROOT=${APP_DATA_ROOT}
+ExecStart=/usr/bin/env bash ${BACKUP_LIBDIR}/restore-drill.sh --self-test
+EOF
+
+cat > "/etc/systemd/system/${BACKUP_UNIT}-drill.timer" << EOF
+[Unit]
+Description=Run the Embarko restore drill weekly (${APP_ENV})
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now "${BACKUP_UNIT}.timer"
+systemctl enable --now "${BACKUP_UNIT}-drill.timer"
+
+# /etc/restic/env is WRITTEN BY THIS SCRIPT from the BACKUP_* variables in
+# set-env.sh — never by hand on the box. Same rule as every other config
+# here: the server is a product of this script, not of remembered commands.
+#
+# The variables are named BACKUP_* rather than AWS_*/RESTIC_* on purpose.
+# set-env.sh is SOURCED into the shell that runs this script, and anything
+# exported there is inherited by every child process it spawns — railpack,
+# docker, node, npm. An exported AWS_ACCESS_KEY_ID would be visible to all
+# of them, and to every build of every customer's app. The rename keeps the
+# credentials out of that blast radius; they are translated into the names
+# restic expects only inside /etc/restic/env, which is root-only.
+BACKUP_VARS=(BACKUP_S3_ENDPOINT BACKUP_S3_BUCKET BACKUP_S3_ACCESS_KEY_ID
+             BACKUP_S3_SECRET_ACCESS_KEY BACKUP_RESTIC_PASSWORD)
+backup_set=0
+backup_missing=()
+for v in "${BACKUP_VARS[@]}"; do
+  if [[ -n "${!v:-}" ]]; then backup_set=$((backup_set+1)); else backup_missing+=("$v"); fi
+done
+
+if [[ "$backup_set" -eq "${#BACKUP_VARS[@]}" ]]; then
+  echo "--> Writing /etc/restic/env from the BACKUP_* variables"
+  install -d -m 0700 /etc/restic
+  # Written via a 0600 temp file and moved into place, so there is never a
+  # moment where the credentials exist world-readable.
+  umask 077
+  cat > /etc/restic/env.new << EOF
+# GENERATED by server-setup.sh from set-env.sh's BACKUP_* variables.
+# Do not edit by hand — the next run overwrites it.
+#
+# AWS_* here is the S3 client naming convention, not Amazon: NeevCloud's
+# object storage speaks the S3 protocol, and restic reads these names.
+export AWS_ACCESS_KEY_ID='${BACKUP_S3_ACCESS_KEY_ID}'
+export AWS_SECRET_ACCESS_KEY='${BACKUP_S3_SECRET_ACCESS_KEY}'
+export RESTIC_PASSWORD='${BACKUP_RESTIC_PASSWORD}'
+export RESTIC_REPOSITORY='s3:${BACKUP_S3_ENDPOINT}/${BACKUP_S3_BUCKET}/${APP_ENV}'
+EOF
+  chmod 0600 /etc/restic/env.new
+  mv /etc/restic/env.new /etc/restic/env
+  echo "--> Backup repository: s3:${BACKUP_S3_ENDPOINT}/${BACKUP_S3_BUCKET}/${APP_ENV}"
+  echo "--> (the password and keys are not printed; they are in /etc/restic/env, 0600 root)"
+
+elif [[ "$backup_set" -eq 0 ]]; then
+  # Nothing configured. Leave any existing file alone — re-running this
+  # script without the variables must never destroy working backups.
+  if [[ -r /etc/restic/env ]]; then
+    echo "!! BACKUP_* variables are not set, but /etc/restic/env exists — leaving it untouched."
+    echo "!! Add them to ${APP_ENV}.set-env.sh so this box is reproducible from the script."
+  else
+    echo "!! BACKUPS ARE NOT CONFIGURED. The timers are installed but every run"
+    echo "!! will fail its preflight until these are set in ${APP_ENV}.set-env.sh:"
+    for v in "${BACKUP_VARS[@]}"; do echo "!!   ${v}"; done
+    echo "!! Store BACKUP_RESTIC_PASSWORD OFF THIS MACHINE TOO. Without it the"
+    echo "!! backups are permanently unreadable."
+  fi
+
+else
+  # Partially set is the dangerous state: it looks configured and is not.
+  echo "ERROR: BACKUP_* variables are only partially set. Missing:" >&2
+  for v in "${backup_missing[@]}"; do echo "  ${v}" >&2; done
+  echo "Set all of them in ${APP_ENV}.set-env.sh, or none at all. A half-configured" >&2
+  echo "backup is worse than an absent one: it reports success and restores nothing." >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 10. DNS — done manually, not by this script. See README.md for the

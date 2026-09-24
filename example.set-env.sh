@@ -24,6 +24,38 @@ export DEPLOY_SERVICE_REPO="REPLACE_ME_WITH_GIT_URL"   # e.g. git@github.com:you
 export API_SERVICE_REPO="REPLACE_ME_WITH_GIT_URL"      # e.g. git@github.com:you/api-service.git
 
 # ---------------------------------------------------------------------
+# BACKUPS — off-box restic backups to NeevCloud S3 (Server-setup/backup-app-data.sh)
+#
+# Set ALL FIVE or NONE. Partially set is refused: a half-configured backup
+# reports success and restores nothing.
+#
+# server-setup.sh writes these into /etc/restic/env (0600, root) itself.
+# Never create that file by hand — the box must stay reproducible from
+# this script alone.
+#
+# Why BACKUP_* and not AWS_*/RESTIC_*: this file is SOURCED, so every
+# export here is inherited by every child process server-setup.sh spawns,
+# including railpack and every customer app build. Credentials named
+# AWS_ACCESS_KEY_ID would be visible to all of them. These names are
+# translated to the ones restic expects only inside /etc/restic/env.
+#
+# BACKUP_S3_ENDPOINT: whichever your NeevCloud console shows for your
+#   credentials -- https://s3-api.neevcloud.com or https://idr01.zata.ai.
+#   They are different services; the wrong one fails as an auth error.
+# BACKUP_RESTIC_PASSWORD: openssl rand -base64 32
+#   STORE IT OFF THIS MACHINE. Without it the backups are unreadable
+#   forever -- it is the one value here with no recovery path.
+#
+# The repository path gets $APP_ENV appended automatically, so prod, test
+# and demo can share one bucket without ever overwriting each other.
+# ---------------------------------------------------------------------
+# export BACKUP_S3_ENDPOINT="https://s3-api.neevcloud.com"
+# export BACKUP_S3_BUCKET="embarko-backups"
+# export BACKUP_S3_ACCESS_KEY_ID=""
+# export BACKUP_S3_SECRET_ACCESS_KEY=""
+# export BACKUP_RESTIC_PASSWORD=""
+
+# ---------------------------------------------------------------------
 # OPTIONAL — sensible defaults, override before sourcing if needed
 # ---------------------------------------------------------------------
 export DEPLOY_SUBDOMAIN="${DEPLOY_SUBDOMAIN:-ship}"

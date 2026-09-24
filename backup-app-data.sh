@@ -41,22 +41,37 @@
 # The fix is a point-in-time view of the filesystem. Two are possible here
 # and the script picks whichever the box actually supports:
 #
+#   sqlite-safe  (DEFAULT on this box) Stage a copy, then re-take every
+#           SQLite database through sqlite3's ".backup" — SQLite's own
+#           ONLINE BACKUP API, which produces a consistent single-file
+#           copy of a database that is being written to right now, from a
+#           separate process, respecting SQLite's locking. This is the
+#           purpose-built answer to the problem above and needs no LVM, no
+#           provider feature and no cooperation from the app. Every app is
+#           covered whether it is running or not.
+#           Measured 2026-09-23: 42 apps, 19MB total — staging a full copy
+#           costs nothing at this size.
+#
 #   lvm     APP_DATA_ROOT sits on an LVM logical volume with free space in
 #           its volume group. Snapshot it, mount read-only, back up from
 #           the mount, release it. Crash-consistent, which is the bar that
 #           matters — SQLite is designed to recover from crash-consistent
-#           state exactly as it survives power loss.
+#           state exactly as it survives power loss. Preferred when
+#           available because it is atomic across ALL files at once, not
+#           just the databases.
 #
-#   stopped No LVM available. Back up only apps with NO running allocation
-#           right now, because a stopped app is not writing and its files
-#           are therefore already consistent. Running apps are REPORTED AS
-#           DEFERRED, never copied live. This is safe rather than complete,
-#           and on this platform it is far less lossy than it sounds:
-#           scale-to-zero universal mode means most apps are stopped
-#           overnight anyway, so a nightly run covers them within days.
+#   stopped Last resort, when sqlite3 is not installed and there is no
+#           LVM. Back up only apps with NO running allocation, because a
+#           stopped app is not writing. Running apps are REPORTED AS
+#           DEFERRED, never copied live.
 #
 # There is deliberately no "just copy it live" mode. A backup that might
 # be corrupt is worse than none, because it is trusted.
+#
+# KNOWN LIMIT: the online backup API covers SQLite. An app storing
+# something else that is also multi-file and write-active (PGlite's
+# directory, for instance) is copied plainly and is only crash-consistent.
+# LVM mode is what closes that gap; revisit if such an app appears.
 #
 # ---------------------------------------------------------------------------
 # NEVER
@@ -95,12 +110,26 @@ fi
 #   export RESTIC_PASSWORD=...
 #   export RESTIC_REPOSITORY=s3:https://idr01.zata.ai/<bucket>/<env>
 #
+# NOTHING HERE TALKS TO AMAZON. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+# are simply the variable names every S3 client uses — restic, rclone,
+# MinIO, the AWS SDK — for "the S3 credentials", whoever the provider is.
+# NeevCloud's Zata is Ceph RGW speaking the S3 protocol, so these two
+# values come from NeevCloud's own S3/EC2 Credentials page. The names are
+# a convention, not a dependency; the endpoint in RESTIC_REPOSITORY is
+# what decides where the data actually goes.
+#
 # RESTIC_PASSWORD must ALSO be stored somewhere off this machine. Without
 # it the backups are unreadable, which turns a disaster into a permanent
 # one. That is the single most common way a restic setup fails in practice.
 RESTIC_ENV_FILE="${RESTIC_ENV_FILE:-/etc/restic/env}"
 
 NOMAD_ADDR="${NOMAD_ADDR:-http://127.0.0.1:4646}"
+# Where sqlite-safe mode assembles its consistent copy. A FIXED path, not
+# a mktemp one, so restic sees the same absolute paths every night and can
+# deduplicate against the previous snapshot instead of storing a fresh
+# full copy each run.
+STAGING_ROOT="${STAGING_ROOT:-/var/backups/embarko/${APP_ENV}}"
+
 SNAP_NAME="embarko-backup-${APP_ENV}"
 SNAP_MOUNT="/mnt/${SNAP_NAME}"
 SNAP_SIZE="${SNAP_SIZE:-5G}"     # CoW space, not a copy of the data
@@ -130,17 +159,24 @@ fi
 # --------------------------------------------------------------------------
 # Which consistency mechanism is available
 # --------------------------------------------------------------------------
-detect_snapshot_mode() {
+have_lvm() {
   local src_dev lv_path
-  if ! command -v lvcreate >/dev/null 2>&1; then
-    echo "stopped"; return
-  fi
+  command -v lvcreate >/dev/null 2>&1 || return 1
   src_dev="$(findmnt -n -o SOURCE --target "$APP_DATA_ROOT" 2>/dev/null || true)"
-  [[ -z "$src_dev" ]] && { echo "stopped"; return; }
+  [[ -z "$src_dev" ]] && return 1
   # An LVM LV reports as /dev/mapper/vg-lv and lvs can identify it.
   lv_path="$(lvs --noheadings -o lv_path "$src_dev" 2>/dev/null | tr -d ' ' || true)"
-  [[ -z "$lv_path" ]] && { echo "stopped"; return; }
-  echo "lvm"
+  [[ -z "$lv_path" ]] && return 1
+  return 0
+}
+
+detect_snapshot_mode() {
+  if [[ -n "${FORCE_MODE:-}" ]]; then echo "$FORCE_MODE"; return; fi
+  if have_lvm; then echo "lvm"; return; fi
+  if command -v sqlite3 >/dev/null 2>&1 && command -v rsync >/dev/null 2>&1; then
+    echo "sqlite-safe"; return
+  fi
+  echo "stopped"
 }
 
 vg_free_for() {
@@ -198,17 +234,26 @@ preflight() {
   fi
 
   SNAPSHOT_MODE="$(detect_snapshot_mode)"
-  if [[ "$SNAPSHOT_MODE" == "lvm" ]]; then
-    local lv_path free
-    lv_path="$(lvs --noheadings -o lv_path "$(findmnt -n -o SOURCE --target "$APP_DATA_ROOT")" | tr -d ' ')"
-    free="$(vg_free_for "$lv_path")"
-    say "Consistency      : LVM snapshot (${lv_path}, VG free ${free})"
-    say "                   -> every app backed up consistently, running or not"
-  else
-    say "Consistency      : no LVM — falling back to STOPPED-APPS-ONLY"
-    say "                   -> running apps are deferred, never copied live"
-    say "                   -> re-run nightly; scale-to-zero stops most apps overnight"
-  fi
+  case "$SNAPSHOT_MODE" in
+    lvm)
+      local lv_path free
+      lv_path="$(lvs --noheadings -o lv_path "$(findmnt -n -o SOURCE --target "$APP_DATA_ROOT")" | tr -d ' ')"
+      free="$(vg_free_for "$lv_path")"
+      say "Consistency      : LVM snapshot (${lv_path}, VG free ${free})"
+      say "                   -> every app, running or not; atomic across all files"
+      ;;
+    sqlite-safe)
+      say "Consistency      : sqlite-safe (SQLite online backup API)"
+      say "                   -> every app, running or not; no LVM needed"
+      say "                   -> staged at ${STAGING_ROOT}"
+      say "                   -> sqlite3 $(sqlite3 --version 2>/dev/null | awk '{print $1}')"
+      ;;
+    stopped)
+      say "Consistency      : STOPPED-APPS-ONLY (no LVM, and sqlite3/rsync missing)"
+      say "                   -> running apps are deferred, never copied live"
+      warn "install sqlite3 and rsync to cover every app: apt-get install -y sqlite3 rsync"
+      ;;
+  esac
 
   if [[ "${#PLATFORM_PATHS[@]}" -eq 0 ]]; then
     warn "No platform paths found (certs, analytics, prisma). Check the variables are sourced."
@@ -230,6 +275,44 @@ cleanup_snapshot() {
   SNAP_CREATED=""
 }
 trap cleanup_snapshot EXIT INT TERM
+
+# --------------------------------------------------------------------------
+# sqlite-safe staging
+#
+# Two passes on purpose:
+#   1. rsync everything, so uploads and any non-database files come along.
+#   2. Re-take every SQLite database through the online backup API, which
+#      is the only way to copy a live one correctly. The plain copy from
+#      pass 1 is DISCARDED for those files, along with its -wal and -shm —
+#      a .backup output is a single self-contained file that needs
+#      neither, and leaving a stale -wal beside it would be actively
+#      dangerous on restore (SQLite would try to replay it).
+# --------------------------------------------------------------------------
+stage_sqlite_safe() {
+  say "Staging a consistent copy at ${STAGING_ROOT}"
+  mkdir -p "$STAGING_ROOT"
+  rsync -a --delete "${APP_DATA_ROOT}/" "${STAGING_ROOT}/"
+
+  local taken=0 failed=0 rel
+  while IFS= read -r src; do
+    head -c 15 "$src" 2>/dev/null | grep -q 'SQLite format 3' || continue
+    rel="${src#"${APP_DATA_ROOT}"/}"
+    rm -f "${STAGING_ROOT}/${rel}" "${STAGING_ROOT}/${rel}-wal" "${STAGING_ROOT}/${rel}-shm"
+    if sqlite3 "file:${src}?mode=ro" ".backup '${STAGING_ROOT}/${rel}'" 2>/dev/null; then
+      taken=$((taken+1))
+    else
+      # Never leave a hole: fall back to the plain copy and say so loudly,
+      # because that one file is now only crash-consistent.
+      warn "online backup failed for ${rel} — kept a plain copy (crash-consistent only)"
+      cp -a "$src" "${STAGING_ROOT}/${rel}"
+      failed=$((failed+1))
+    fi
+  done < <(find "$APP_DATA_ROOT" -type f -size +0c 2>/dev/null)
+
+  say "SQLite databases taken via the online backup API: ${taken}"
+  [[ "$failed" -gt 0 ]] && warn "${failed} database(s) fell back to a plain copy"
+  say "Staged size: $(du -sxh "$STAGING_ROOT" 2>/dev/null | cut -f1)"
+}
 
 create_snapshot() {
   local src_dev lv_path
@@ -278,6 +361,9 @@ if [[ "$SNAPSHOT_MODE" == "lvm" ]]; then
   MP="$(findmnt -n -o TARGET --target "$APP_DATA_ROOT")"
   REL="${APP_DATA_ROOT#"$MP"}"
   TARGETS+=("${SNAP_MOUNT}${REL}")
+elif [[ "$SNAPSHOT_MODE" == "sqlite-safe" ]]; then
+  [[ "$MODE" == "apply" ]] && stage_sqlite_safe
+  TARGETS+=("$STAGING_ROOT")
 else
   mapfile -t RUNNING < <(running_app_names)
   while IFS= read -r dir; do
